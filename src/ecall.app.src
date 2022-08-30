@@ -1,0 +1,14 @@
+{application, ecall,
+ [{description, "erlang library for group remote calls and casts"},
+  {vsn, git},
+  {registered, []},
+  {applications,
+   [kernel,
+    stdlib
+   ]},
+  {env,[]},
+  {modules, []},
+
+  {licenses, ["MIT"]},
+  {links, []}
+ ]}.
