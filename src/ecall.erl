@@ -154,8 +154,7 @@ call_all_wait(Ns,M,F,As)->
   Owner = self(),
   Master = spawn_link(fun()->async_call_all_wait(Owner,Ns,M,F,As) end),
   receive
-    {ok,Master,Result}->{ok,Result};
-    {error,Master,Error}->{error,Error}
+    {Master,OKs, Errors}->{ OKs, Errors }
   end.
 async_call_all_wait(Owner,Ns,M,F,As)->
   Master = self(),
@@ -177,7 +176,7 @@ wait_all_wait(Owner, WaitFor, Replies, Rejects) when WaitFor > 0 ->
       wait_all_wait(Owner, WaitFor-1,Replies,[{N,{badrpc,Reason}}|Rejects])
   end;
 wait_all_wait(Owner, _WaitFor=0, Replies, Rejects)->
-  Owner ! {lists:reverse(Replies),lists:reverse(Rejects)}.
+  Owner ! {self(), lists:reverse(Replies),lists:reverse(Rejects)}.
 
 %-------------CAST------------------------------------------
 cast_one(Ns,M,F,As)->
