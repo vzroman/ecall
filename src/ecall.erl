@@ -165,15 +165,15 @@ async_call_all_wait(Owner,Ns,M,F,As)->
 wait_all_wait(Owner, WaitFor, Replies, Rejects) when WaitFor > 0 ->
   % I'm the master
   receive
-    {N,{ok,Result}}->
-      ?LOGDEBUG("~p ok ~p",[N,Result]),
-      wait_all_wait(Owner, WaitFor-1,[{N,Result}|Replies],Rejects);
     {N,{error,E}}->
       ?LOGERROR("~p error ~p",[N,E]),
       wait_all_wait(Owner, WaitFor-1,Replies,[{N,E}|Rejects]);
     {N,{badrpc, Reason}}->
       ?LOGERROR("~p badrpc as error ~p",[N,Reason]),
-      wait_all_wait(Owner, WaitFor-1,Replies,[{N,{badrpc,Reason}}|Rejects])
+      wait_all_wait(Owner, WaitFor-1,Replies,[{N,{badrpc,Reason}}|Rejects]);
+    {N,Result}->
+      ?LOGDEBUG("~p result ~p",[N,Result]),
+      wait_all_wait(Owner, WaitFor-1,[{N,Result}|Replies],Rejects)
   end;
 wait_all_wait(Owner, _WaitFor=0, Replies, Rejects)->
   Owner ! {self(), lists:reverse(Replies),lists:reverse(Rejects)}.
