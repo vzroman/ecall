@@ -65,7 +65,7 @@ call_any([],_M,_F,_As,_RpcErr)->
 call_any(Ns,M,F,As,RpcErr)->
   ?LOGDEBUG("~p with ~p:~p(~p), RpcErr",[Ns,M,F,As,RpcErr]),
   Owner = self(),
-  Master = spawn_link(fun()->async_call_any(Owner,Ns,M,F,As,RpcErr) end),
+  Master = spawn(fun()->async_call_any(Owner,Ns,M,F,As,RpcErr) end),
   receive
     {ok,Master,Result}->{ok,Result};
     {error,Master,Error}->{error,Error}
@@ -110,7 +110,7 @@ call_all([],_M,_F,_As,_RpcErr)->
 call_all(Ns,M,F,As,RpcErr)->
   ?LOGDEBUG("~p with ~p:~p(~p), RpcErr ~p",[Ns,M,F,As,RpcErr]),
   Owner = self(),
-  Master = spawn_link(fun()->async_call_all(Owner,Ns,M,F,As,RpcErr) end),
+  Master = spawn(fun()->async_call_all(Owner,Ns,M,F,As,RpcErr) end),
   receive
     {ok,Master,Result}->{ok,Result};
     {error,Master,Error}->{error,Error}
@@ -152,7 +152,7 @@ call_all_wait([],_M,_F,_As)->
 call_all_wait(Ns,M,F,As)->
   ?LOGDEBUG("~p with ~p:~p(~p)",[Ns,M,F,As]),
   Owner = self(),
-  Master = spawn_link(fun()->async_call_all_wait(Owner,Ns,M,F,As) end),
+  Master = spawn(fun()->async_call_all_wait(Owner,Ns,M,F,As) end),
   receive
     {Master,OKs, Errors}->{ OKs, Errors }
   end.
