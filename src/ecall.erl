@@ -43,9 +43,6 @@ call_one( Ns,M,F,As,Errors,RpcErr)->
   N = ?RAND( Ns ),
   ?LOGDEBUG("~p from ~p with ~p:~p(~p), RpcErr ~p",[N,Ns,M,F,As,RpcErr]),
   case rpc:call(N, M, F, As) of
-    {ok,Result} ->
-      ?LOGDEBUG("~p ok ~p",[N,Result]),
-      {ok,{N,Result}};
     {error,Error}->
       ?LOGERROR("~p error ~p",[N,Error]),
       call_one( Ns --[N], M, F, As, [{N,Error}|Errors]);
@@ -54,7 +51,10 @@ call_one( Ns,M,F,As,Errors,RpcErr)->
       call_one( Ns --[N], M, F, As, [{N,{badrpc, Reason}}|Errors]);
     {badrpc, Reason} ->
       ?LOGWARNING("~p badrpc ~p",[N,Reason]),
-      call_one( Ns --[N], M, F, As, Errors)
+      call_one( Ns --[N], M, F, As, Errors);
+    Result->
+      ?LOGDEBUG("~p ok ~p",[N,Result]),
+      {ok,{N,Result}}
   end.
 
 %-----------call any----------------------------------------
@@ -74,15 +74,12 @@ call_any(Ns,M,F,As,RpcErr)->
 async_call_any(Owner,Ns,M,F,As,RpcErr)->
   Master = self(),
   Callers =
-    [ spawn_link(fun()->Master ! {N,rpc:call(N, M, F, As)} end) || N <- Ns ],
+    [ spawn(fun()->Master ! {N,rpc:call(N, M, F, As)} end) || N <- Ns ],
   wait_any(Owner, length(Callers), _Errors=[], RpcErr).
 
 wait_any(Owner, WaitFor, Errors, RpcErr) when WaitFor > 0 ->
   % I'm the master
   receive
-    {N,{ok,Result}}->
-      ?LOGDEBUG("~p ok ~p",[N,Result]),
-      Owner ! {ok,self(),{N,Result}};
     {N,{error,E}}->
       ?LOGERROR("~p error ~p",[N,E]),
       wait_any(Owner, WaitFor-1,[{N,E}],RpcErr);
@@ -91,7 +88,10 @@ wait_any(Owner, WaitFor, Errors, RpcErr) when WaitFor > 0 ->
       wait_any(Owner, WaitFor-1,[{N,{badrpc, Reason}}],RpcErr);
     {N,{badrpc, Reason}}->
       ?LOGWARNING("~p badrpc ~p",[N,Reason]),
-      wait_any(Owner,WaitFor-1,Errors,RpcErr)
+      wait_any(Owner,WaitFor-1,Errors,RpcErr);
+    {N,Result}->
+      ?LOGDEBUG("~p: result ~p",[N,Result]),
+      Owner ! {ok,self(),{N,Result}}
   end;
 wait_any(Owner, _WaitFor=0, Errors,_RpcErr)->
   if
@@ -118,15 +118,12 @@ call_all(Ns,M,F,As,RpcErr)->
 async_call_all(Owner,Ns,M,F,As,RpcErr)->
   Master = self(),
   Callers =
-    [ spawn_link(fun()->Master ! {N,rpc:call(N, M, F, As)} end) || N <- Ns ],
+    [ spawn(fun()->Master ! {N,rpc:call(N, M, F, As)} end) || N <- Ns ],
   wait_all(Owner, length(Callers), _OKs=[], RpcErr).
 
 wait_all(Owner, WaitFor, OKs, RpcErr) when WaitFor > 0 ->
   % I'm the master
   receive
-    {N,{ok,Result}}->
-      ?LOGDEBUG("~p ok ~p",[N,Result]),
-      wait_all(Owner, WaitFor-1,[{N,Result}|OKs],RpcErr);
     {N,{error,E}}->
       ?LOGERROR("~p error ~p",[N,E]),
       Owner ! {error,self(), {N,E}};
@@ -135,7 +132,10 @@ wait_all(Owner, WaitFor, OKs, RpcErr) when WaitFor > 0 ->
       Owner ! {error,self(), {N,{badrpc, Reason}}};
     {N,{badrpc, Reason}} ->
       ?LOGWARNING("~p badrpc ~p",[N,Reason]),
-      wait_all(Owner,WaitFor-1,OKs,RpcErr)
+      wait_all(Owner,WaitFor-1,OKs,RpcErr);
+    {N,Result}->
+      ?LOGDEBUG("~p result: ~p",[N,Result]),
+      wait_all(Owner, WaitFor-1,[{N,Result}|OKs],RpcErr)
   end;
 wait_all(Owner, _WaitFor=0, OKs,_RpcErr)->
   if
