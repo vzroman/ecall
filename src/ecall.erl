@@ -45,13 +45,13 @@ call_one( Ns,M,F,As,Errors,RpcErr)->
   case rpc:call(N, M, F, As) of
     {error,Error}->
       ?LOGERROR("~p error ~p",[N,Error]),
-      call_one( Ns --[N], M, F, As, [{N,Error}|Errors]);
+      call_one( Ns --[N], M, F, As, [{N,Error}|Errors], RpcErr);
     {badrpc, Reason} when RpcErr ->
       ?LOGERROR("~p badrpc error ~p",[N,Reason]),
-      call_one( Ns --[N], M, F, As, [{N,{badrpc, Reason}}|Errors]);
+      call_one( Ns --[N], M, F, As, [{N,{badrpc, Reason}}|Errors], RpcErr);
     {badrpc, Reason} ->
       ?LOGWARNING("~p badrpc ~p",[N,Reason]),
-      call_one( Ns --[N], M, F, As, Errors);
+      call_one( Ns --[N], M, F, As, Errors, RpcErr);
     Result->
       ?LOGDEBUG("~p ok ~p",[N,Result]),
       {ok,{N,Result}}
@@ -179,10 +179,12 @@ wait_all_wait(Owner, _WaitFor=0, Replies, Rejects)->
   Owner ! {self(), lists:reverse(Replies),lists:reverse(Rejects)}.
 
 %-------------CAST------------------------------------------
-cast_one(Ns,M,F,As)->
+cast_one(Ns,M,F,As) when length(Ns) > 0 ->
   N = ?RAND(Ns),
   ?LOGDEBUG("~p from ~p with ~p:~p(~p)",[N,Ns,M,F,As]),
   rpc:cast(N, M, F, As),
+  ok;
+cast_one(_Nsm ,_M, _F, _As) ->
   ok.
 
 cast_all(Ns,M,F,As)->
