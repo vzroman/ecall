@@ -148,7 +148,7 @@ wait_all(Owner, _WaitFor=0, OKs,_RpcErr)->
 
 %-----------call all wait----------------------------------------
 call_all_wait([],_M,_F,_As)->
-  {error,none_is_available};
+  {[],[]};
 call_all_wait(Ns,M,F,As)->
   ?LOGDEBUG("~p with ~p:~p(~p)",[Ns,M,F,As]),
   Owner = self(),
