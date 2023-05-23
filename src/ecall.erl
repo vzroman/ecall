@@ -78,8 +78,9 @@ wait_any( IDs, Errors, RpcErr )->
       _:{ _E, _N, _IDs } -> {error, _N, _E, _IDs}
     end
   of
-    {{response, Result}, N, _RestIDs}->
+    {{response, Result}, N, RestIDs}->
       ?LOGDEBUG("~p: result ~p",[N,Result]),
+      drop_replies( RestIDs ),
       {ok, {N, Result}};
     {error, N, E, RestIDs} ->
       ?LOGERROR("~p error ~p",[N,E]),
@@ -95,6 +96,20 @@ wait_any( IDs, Errors, RpcErr )->
         length( Errors ) > 0 -> {error, Errors};
         true -> {error,none_is_available}
       end
+  end.
+
+drop_replies( RestIDs )->
+  case
+    try erpc:receive_response( RestIDs, 0, true )
+    catch
+      _:{erpc, timeout}-> ok;
+      _:{ _E, _N, _IDs } -> {error, _IDs}
+    end
+  of
+    ok -> ok;
+    no_response -> ok;
+    {error, IDs} -> drop_replies( IDs );
+    {_, _, IDs} -> drop_replies( IDs )
   end.
 
 %-----------call all----------------------------------------
