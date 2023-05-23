@@ -64,42 +64,37 @@ call_any([],_M,_F,_As,_RpcErr)->
   {error,none_is_available};
 call_any(Ns,M,F,As,RpcErr)->
   ?LOGDEBUG("~p with ~p:~p(~p), RpcErr",[Ns,M,F,As,RpcErr]),
-  Owner = self(),
-  Master = spawn(fun()->async_call_any(Owner,Ns,M,F,As,RpcErr) end),
-  receive
-    {ok,Master,Result}->{ok,Result};
-    {error,Master,Error}->{error,Error}
-  end.
+  IDs =
+    lists:foldl(fun(N, Acc)->
+      erpc:send_request(N, M, F, As, N, Acc)
+    end, erpc:reqids_new(), Ns),
+  wait_any( IDs, _Errors = [], RpcErr ).
 
-async_call_any(Owner,Ns,M,F,As,RpcErr)->
-  Master = self(),
-  Callers =
-    [ spawn(fun()->Master ! {N,rpc:call(N, M, F, As)} end) || N <- Ns ],
-  wait_any(Owner, length(Callers), _Errors=[], RpcErr).
-
-wait_any(Owner, WaitFor, Errors, RpcErr) when WaitFor > 0 ->
-  % I'm the master
-  receive
-    {N,{error,E}}->
-      ?LOGERROR("~p error ~p",[N,E]),
-      wait_any(Owner, WaitFor-1,[{N,E}],RpcErr);
-    {N,{badrpc, Reason}} when RpcErr->
-      ?LOGERROR("~p badrpc error ~p",[N,Reason]),
-      wait_any(Owner, WaitFor-1,[{N,{badrpc, Reason}}],RpcErr);
-    {N,{badrpc, Reason}}->
-      ?LOGWARNING("~p badrpc ~p",[N,Reason]),
-      wait_any(Owner,WaitFor-1,Errors,RpcErr);
-    {N,Result}->
+wait_any( IDs, Errors, RpcErr )->
+  case
+    try erpc:wait_response(IDs, _Timeout = infinity, _Delete = true)
+    catch
+      _:{{erpc, _E}, _N, _IDs } -> {erpc, _N, _E, _IDs};
+      _:{ _E, _N, _IDs } -> {error, _N, _E, _IDs}
+    end
+  of
+    {{response, Result}, N, _RestIDs}->
       ?LOGDEBUG("~p: result ~p",[N,Result]),
-      Owner ! {ok,self(),{N,Result}}
-  end;
-wait_any(Owner, _WaitFor=0, Errors,_RpcErr)->
-  if
-    length(Errors) >0 ->
-      Owner ! {error,self(), Errors};
-    true->
-      % All were badrpc
-      Owner ! {error,self(),none_is_available}
+      {ok, {N, Result}};
+    {error, N, E, RestIDs} ->
+      ?LOGERROR("~p error ~p",[N,E]),
+      wait_any(RestIDs, [{N,E}|Errors],RpcErr);
+    {erpc, N, E, RestIDs} when RpcErr ->
+      ?LOGERROR("~p badrpc error ~p",[N,E]),
+      wait_any(RestIDs, [{N,{badrpc, E}}|Errors],RpcErr);
+    {erpc, N, E, RestIDs} ->
+      ?LOGWARNING("~p badrpc ~p",[N,E]),
+      wait_any(RestIDs, Errors,RpcErr);
+    no_response ->
+      if
+        length( Errors ) > 0 -> {error, Errors};
+        true -> {error,none_is_available}
+      end
   end.
 
 %-----------call all----------------------------------------
