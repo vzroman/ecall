@@ -91,7 +91,7 @@ wait_any( IDs, Errors, RpcErr )->
     {erpc, N, E, RestIDs} ->
       ?LOGWARNING("~p badrpc ~p",[N,E]),
       wait_any(RestIDs, Errors,RpcErr);
-    no_response ->
+    Other when Other =:= no_response; Other =:= no_request ->
       if
         length( Errors ) > 0 -> {error, Errors};
         true -> {error,none_is_available}
@@ -106,10 +106,9 @@ drop_replies( RestIDs )->
       _:{ _E, _N, _IDs } -> {error, _IDs}
     end
   of
-    ok -> ok;
-    no_response -> ok;
     {error, IDs} -> drop_replies( IDs );
-    {_, _, IDs} -> drop_replies( IDs )
+    {_, _, IDs} -> drop_replies( IDs );
+    _ -> ok
   end.
 
 %-----------call all----------------------------------------
