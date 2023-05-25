@@ -5,9 +5,12 @@
 -export([
   erpc_call/2, do_erpc_call_request/1,
   erpc_cast/2, do_erpc_cast_request/1,
+  spawn_test/2, do_spawn_request/1,
   simple_send/3, simple_send_receive/1,
   pool_send/3, pool_send_receive/1,
-  pool_tcp_send/3, pool_tcp_listen/1
+  pool_tcp_send/3, pool_tcp_listen/1,
+  partisan_call/2, do_partisan_call_request/1,
+  partisan_cast/2, do_partisan_cast_request/1
 ]).
 
 -define(LOG(Text,Params),lager:info(Text,Params)).
@@ -85,6 +88,23 @@ do_erpc_cast( Node, _Count, TS ) ->
   do_erpc_cast( Node, ?LOG_COUNT, ?TS ).
 
 do_erpc_cast_request( _Data )->
+  ok.
+
+
+spawn_test( Node, Count )->
+  ?LOG("cast test start node ~p count ~p",[ Node, Count ]),
+  [ spawn(fun()-> do_spawn(Node, ?LOG_COUNT, ?TS) end)  || _ <- lists:seq(1,Count)],
+  ok.
+
+do_spawn( Node, Count, TS ) when Count > 0 ->
+  spawn(Node, ?MODULE, do_spawn_request, [?DATA]),
+  do_spawn( Node, Count-1, TS );
+do_spawn( Node, _Count, TS ) ->
+  ?LOG("duration ~p",[ ?TS - TS ]),
+  timer:sleep(100),
+  do_spawn( Node, ?LOG_COUNT, ?TS ).
+
+do_spawn_request( _Data )->
   ok.
 
 simple_send( Name, Node, Count )->
@@ -209,3 +229,40 @@ in_connection( Socket, Count ) when Count > 0->
 in_connection( Socket, _Count )->
   ?LOG("accept ~p",[?LOG_COUNT]),
   in_connection( Socket, ?LOG_COUNT ).
+
+
+partisan_call( Node, Count )->
+  ?LOG("partisan call test start node ~p count ~p",[ Node, Count ]),
+  NodeSpec = erpc:call(Node, partisan, node_spec,[]),
+  partisan_peer_service:join(NodeSpec),
+  [ spawn(fun()-> do_partisan_call(Node, ?LOG_COUNT, ?TS) end)  || _ <- lists:seq(1,Count)],
+  ok.
+
+do_partisan_call( Node, Count, TS ) when Count > 0 ->
+  _= partisan_erpc:call( Node, ?MODULE, do_partisan_call_request, [ ?DATA ] ),
+  do_partisan_call( Node, Count-1, TS );
+do_partisan_call( Node, _Count, TS ) ->
+  ?LOG("duration ~p",[ ?TS - TS ]),
+  timer:sleep(100),
+  do_partisan_call( Node, ?LOG_COUNT, ?TS ).
+
+do_partisan_call_request( _Data )->
+  ok.
+
+partisan_cast( Node, Count )->
+  ?LOG("partisan cast test start node ~p count ~p",[ Node, Count ]),
+  NodeSpec = erpc:call(Node, partisan, node_spec,[]),
+  partisan_peer_service:join(NodeSpec),
+  [ spawn(fun()-> do_partisan_cast(Node, ?LOG_COUNT, ?TS) end)  || _ <- lists:seq(1,Count)],
+  ok.
+
+do_partisan_cast( Node, Count, TS ) when Count > 0 ->
+  _= partisan_erpc:cast( Node, ?MODULE, do_partisan_cast_request, [ ?DATA ] ),
+  do_partisan_cast( Node, Count-1, TS );
+do_partisan_cast( Node, _Count, TS ) ->
+  ?LOG("duration ~p",[ ?TS - TS ]),
+  timer:sleep(100),
+  do_partisan_cast( Node, ?LOG_COUNT, ?TS ).
+
+do_partisan_cast_request( _Data )->
+  ok.

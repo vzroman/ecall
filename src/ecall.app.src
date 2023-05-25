@@ -5,7 +5,8 @@
   {mod, {ecall_app, []}},
   {applications,
    [kernel,
-    stdlib
+    stdlib,
+    partisan
    ]},
   {env,[]},
   {modules, []},
