@@ -5,6 +5,7 @@
 -export([
   erpc_call/2, do_erpc_call_request/1,
   erpc_cast/2, do_erpc_cast_request/1,
+  spawn_test/2, do_spawn_request/1,
   simple_send/3, simple_send_receive/1,
   pool_send/3, pool_send_receive/1,
   pool_tcp_send/3, pool_tcp_listen/1
@@ -87,6 +88,23 @@ do_erpc_cast( Node, _Count, TS ) ->
 do_erpc_cast_request( _Data )->
   ok.
 
+
+spawn_test( Node, Count )->
+  ?LOG("cast test start node ~p count ~p",[ Node, Count ]),
+  [ spawn(fun()-> do_spawn(Node, ?LOG_COUNT, ?TS) end)  || _ <- lists:seq(1,Count)],
+  ok.
+
+do_spawn( Node, Count, TS ) when Count > 0 ->
+  spawn(Node, ?MODULE, do_spawn_request, [?DATA]),
+  do_spawn( Node, Count-1, TS );
+do_spawn( Node, _Count, TS ) ->
+  ?LOG("duration ~p",[ ?TS - TS ]),
+  timer:sleep(100),
+  do_spawn( Node, ?LOG_COUNT, ?TS ).
+
+do_spawn_request( _Data )->
+  ok.
+
 simple_send( Name, Node, Count )->
   ?LOG("simple send test start partner name ~p, node ~p, count ~p",[ Name, Node, Count ]),
   [ spawn(fun()-> do_simple_send(Name, Node, ?LOG_COUNT, ?TS) end)  || _ <- lists:seq(1,Count)],
@@ -112,15 +130,20 @@ simple_send_receive_loop( _Count )->
   ?LOG("accept ~p",[?LOG_COUNT]),
   simple_send_receive_loop( ?LOG_COUNT ).
 
-
+%=====================================================================
+% THE WINNER!
+%=====================================================================
 pool_send( Name, Node, Count )->
   ?LOG("pool send test start: partner name ~p, node ~p, count ~p",[ Name, Node, Count ]),
-  Pool = [ {list_to_atom( atom_to_list( Name )++ integer_to_list(I) ), Node} || I <- lists:seq(1,16) ],
+  Pool = [ list_to_atom( atom_to_list( Name )++ integer_to_list(I) ) || I <- lists:seq(1,16) ],
+  [ register(P, spawn(fun()->pool_send_loop( {P,Node}, []) end)) || P <- Pool],
   [ spawn(fun()-> do_pool_send(Pool, Pool, ?LOG_COUNT, ?TS) end)  || _ <- lists:seq(1,Count)],
   ok.
 
 do_pool_send( [P|Rest], Pool, Count, TS ) when Count > 0 ->
-  erlang:send(P, term_to_binary({request, ?DATA}), [noconnect]),
+  Ref = make_ref(),
+  P ! {request, self(), Ref, ?DATA},
+  receive {ok, Ref} -> ok end,
   do_pool_send( Rest, Pool, Count-1, TS );
 do_pool_send( [], Pool, Count, TS )->
   do_pool_send( Pool, Pool, Count, TS );
@@ -129,6 +152,24 @@ do_pool_send( Rest, Pool, _Count, TS ) ->
   timer:sleep(100),
   do_pool_send( Rest, Pool, ?LOG_COUNT, ?TS ).
 
+pool_send_loop( Partner, [] )->
+  receive
+    {request, PID, Ref, Data} ->pool_send_loop(Partner,[{PID,Ref,Data}])
+  end;
+pool_send_loop( Partner, Buffer ) when length(Buffer) < 1000->
+  receive
+    {request, PID, Ref, Data} -> pool_send_loop( Partner, [{PID,Ref,Data}|Buffer] )
+  after
+    0 ->
+      Packet = [ begin PID ! {ok, Ref}, Data end || {PID, Ref, Data} <- Buffer ],
+      Partner ! Packet,
+      pool_send_loop(Partner, [])
+  end;
+pool_send_loop( Partner, Buffer )->
+  Packet = [ begin PID ! {ok, Ref}, Data end || {PID, Ref, Data} <- Buffer ],
+  Partner ! Packet,
+  pool_send_loop( Partner, [] ).
+
 pool_send_receive( Name )->
   Pool = [ list_to_atom( atom_to_list( Name )++ integer_to_list(I) ) || I <- lists:seq(1,16) ],
   [ spawn(fun()->register( P, self()), pool_send_receive_loop(?LOG_COUNT) end) || P <- Pool ],
@@ -136,14 +177,13 @@ pool_send_receive( Name )->
 
 pool_send_receive_loop( Count ) when Count > 0->
   receive
-    Data->
-      binary_to_term( Data ),
+    _Data->
       pool_send_receive_loop( Count - 1 )
   end;
 pool_send_receive_loop( _Count )->
   ?LOG("accept ~p",[?LOG_COUNT]),
   pool_send_receive_loop( ?LOG_COUNT ).
-
+%=======================================================================
 
 pool_tcp_send( Host, Port, Count )->
   Self = self(),
