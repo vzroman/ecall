@@ -33,7 +33,16 @@ init([]) ->
     modules=>[ ecall_receive ]
   },
 
-  _PG_monitor = #{
+  ConnectionSup=#{
+    id=>ecall_connection_sup,
+    start=>{ecall_connection_sup,start_link,[]},
+    restart=>permanent,
+    shutdown=>?STOP_TIMEOUT,
+    type=>supervisor,
+    modules=>[ecall_connection_sup]
+  },
+
+  PG_monitor = #{
     id=> ecall_pg_monitor,
     start=>{ ecall_pg_monitor, start_link, []},
     restart=> permanent,
@@ -50,5 +59,7 @@ init([]) ->
 
   {ok, {Supervisor, [
     PG,
-    Receive
+    Receive,
+    ConnectionSup,
+    PG_monitor
   ]}}.
