@@ -46,22 +46,24 @@ handle_cast(Request,State)->
 handle_info({Ref, join, ?pg_group, Neighbours}, #state{ ref = Ref} = State)->
 
   [ try
-      ?LOGINFO("connecting to ~p",[ node(N) ]),
-      ecall_connection:connect( N )
+      Node = node(N),
+      ?LOGINFO("connecting to ~p",[ Node ]),
+      ecall_connection:connect( Node )
     catch
       _:E -> ?LOGERROR("unable to connect to ~p, error ~p",[ node(N), E ])
-    end|| N <- Neighbours],
+    end|| N <- Neighbours, node(N) =/= node()],
 
   {noreply,State};
 
 handle_info({Ref, leave, ?pg_group, LeftNeighbours}, #state{ ref = Ref} = State)->
 
   [ try
-      ?LOGWARNING("disconnect from ~p",[N]),
-      ecall_connection:disconnect( N )
+      Node = node(N),
+      ?LOGWARNING("disconnect from ~p",[Node]),
+      ecall_connection:disconnect( Node )
     catch
       _:E -> ?LOGERROR("unable to disconnect to ~p, error ~p",[ node(N), E ])
-    end|| N <- LeftNeighbours],
+    end|| N <- LeftNeighbours, node(N) =/= node()],
 
   {noreply,State};
 
