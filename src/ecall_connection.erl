@@ -33,7 +33,8 @@ send( To, Message )->
     undefined ->
       To ! Message;
     {Proxy, RemoteTo} ->
-      Proxy ! {do, {send, RemoteTo, Message}}
+      Proxy ! {do, {send, RemoteTo, Message}},
+      Message
   end.
 
 
