@@ -1,16 +1,14 @@
 
 -module(ecall_sup).
 
+-include("ecall.hrl").
+
 -behaviour(supervisor).
 
 -export([
   start_link/0,
   init/1
 ]).
-
--define(MAX_RESTARTS,10).
--define(MAX_PERIOD,1000).
--define(STOP_TIMEOUT,1000).
 
 start_link() ->
     supervisor:start_link(?MODULE, []).
@@ -24,6 +22,15 @@ init([]) ->
     shutdown=> ?STOP_TIMEOUT,
     type=>worker,
     modules=>[ pg ]
+  },
+
+  Receive = #{
+    id=> receive_pool,
+    start=>{ ecall_receive, start_link, []},
+    restart=> permanent,
+    shutdown=> ?STOP_TIMEOUT,
+    type=> worker,
+    modules=>[ ecall_receive ]
   },
 
   _PG_monitor = #{
@@ -42,5 +49,6 @@ init([]) ->
   },
 
   {ok, {Supervisor, [
-    PG
+    PG,
+    Receive
   ]}}.

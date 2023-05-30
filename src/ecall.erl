@@ -1,6 +1,8 @@
 
 -module(ecall).
 
+-include("ecall.hrl").
+
 %%=================================================================
 %% API
 %%=================================================================
@@ -13,12 +15,6 @@
   cast_one/4,
   cast_all/4
 ]).
-
--define(T,atom_to_list(?FUNCTION_NAME)++": ").
--define(LOGDEBUG(Text,Params),lager:debug(?T++Text,Params)).
--define(LOGINFO(Text,Params),lager:info(?T++Text,Params)).
--define(LOGWARNING(Text,Params),lager:warning(?T++Text,Params)).
--define(LOGERROR(Text,Params),lager:error(?T++Text,Params)).
 
 -define(RAND(List),
   begin
