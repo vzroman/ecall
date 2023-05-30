@@ -152,7 +152,7 @@ collect_buffer( Count ) when Count < ?BATCH_SIZE->
   end.
 
 do_send(Buffer, #state{ remote = Remote } = State)->
-  Remote ! Buffer,
+  catch Remote ! {batch, node(), Buffer},
   State.
 
 %%=================================================================
