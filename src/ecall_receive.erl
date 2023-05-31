@@ -53,7 +53,6 @@ worker_loop( State )->
       State1 = handle_batch(Batch, State),
       worker_loop( State1 );
     {'DOWN', _, process, PID, Reason}->
-      ?LOGINFO("DEBUG: down reason ~p",[Reason]),
       case maps:take(PID, State#state.pid2ref) of
         { #p2r{ref = Ref, pid = ClientPID }, P2R }->
           if
@@ -68,7 +67,6 @@ worker_loop( State )->
           worker_loop( State )
       end;
     _Unexpected->
-      ?LOGINFO("DEBUG: unexpected ~p",[_Unexpected]),
       worker_loop( State )
   end.
 
