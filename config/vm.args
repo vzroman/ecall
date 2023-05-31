@@ -3,7 +3,7 @@
 ######################################################################
 
 ## Name of the node
--name ecall@host.domain
+-name ecall@host.ecall
 
 ## Cookie for distributed erlang
 -setcookie ecall
