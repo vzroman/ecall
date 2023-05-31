@@ -69,7 +69,7 @@ call(Node, Module, Function, Args)->
   end.
 
 
--record(connection,{ master, pool, counter }).
+-record(connection,{ node, master, pool, counter }).
 %%=================================================================
 %% SERVICE API
 %%=================================================================
@@ -124,7 +124,7 @@ init_connection(Node, Sup)->
         maps:from_list([ {I,spawn_link(fun()->worker_loop(W) end)} || {I, W} <- lists:zip( lists:seq(0, length(Workers)-1), Workers) ]),
       Connections = persistent_term:get( ?MODULE, #{}),
 
-      Connection = #connection{ master = Self, pool = Pool, counter = Counter },
+      Connection = #connection{node = Node, master = Self, pool = Pool, counter = Counter },
       persistent_term:put(?MODULE, Connections#{ Node => Connection }),
 
       Sup ! {ready, Self},
@@ -137,9 +137,11 @@ init_connection(Node, Sup)->
       Sup ! {error, Self, connect_timeout}
   end.
 
-master_loop( Connection )->
+master_loop( #connection{node = Node} = Connection )->
   receive
     {'EXIT',_, Reason}->
+      Connections = persistent_term:get( ?MODULE, #{}),
+      persistent_term:put(?MODULE, maps:remove( Node, Connections )),
       exit( Reason );
     _->
       master_loop( Connection )
