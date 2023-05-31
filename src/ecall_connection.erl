@@ -7,7 +7,8 @@
 %% API
 %%=================================================================
 -export([
-  send/2
+  send/2,
+  call/4
 ]).
 
 %%=================================================================
@@ -35,6 +36,36 @@ send( To, Message )->
     {Proxy, RemoteTo} ->
       Proxy ! {do, {send, RemoteTo, Message}},
       Message
+  end.
+
+
+% Make a reference and send:
+%   {do, {call, Ref, self(), M, F, As}}
+% to a proxy.
+% The receiver spawns a monitored process and keeps its PID
+% as #{ PID => {Ref, ClientPID }}
+% The spawned process executes M:F(As) and sends the result to
+% ClientPID as {Ref, Result}.
+% On finishing of the spawned process the receiver gets {'DOWN',_,SpawnedPID, Reason}.
+% It takes corresponding {Ref, ClientPID} and if the Reason is not 'normal' sends the
+%   {'DOWN', Ref, Reason} to ClientPID.
+call(Node, Module, Function, Args)->
+  case get_node_proxy( Node ) of
+    undefined ->
+      ecall_erpc:call( Node, Module, Function, Args );
+    Proxy ->
+      Ref = erlang:monitor( process, Proxy ),
+      try
+        Proxy ! {do, {call, Ref, self(),  Module, Function, Args}},
+        receive
+          {Ref, {error, _} = Error} -> Error;
+          {Ref, Result} -> {ok, Result};
+          {'DOWN', Ref, Reason}-> {error, {exit,Reason}};
+          {'DOWN', Ref, process, _, Reason}->{error,{badrpc, Reason}}
+        end
+      after
+        erlang:demonitor(Ref, flush)
+      end
   end.
 
 
@@ -90,7 +121,7 @@ init_connection(Node, Sup)->
     {Ref, Workers}->
       Counter = atomics:new(1,[{signed,false}]),
       Pool =
-        maps:from_list([ {I,spawn_link(fun()->init_worker(W, Self) end)} || {I, W} <- lists:zip( lists:seq(0, length(Workers)-1), Workers) ]),
+        maps:from_list([ {I,spawn_link(fun()->worker_loop(W) end)} || {I, W} <- lists:zip( lists:seq(0, length(Workers)-1), Workers) ]),
       Connections = persistent_term:get( ?MODULE, #{}),
 
       Connection = #connection{ master = Self, pool = Pool, counter = Counter },
@@ -114,67 +145,54 @@ master_loop( Connection )->
       master_loop( Connection )
   end.
 
--record(state,{remote, master}).
-init_worker( Remote, Master )->
-
-  process_flag(trap_exit,true),
-
-  worker_loop(#state{ master = Master, remote = Remote } ).
-
-
 %%=================================================================
-%% WORKER API
+%% WORKER LOOP
 %%=================================================================
-worker_loop( State )->
-  case try collect_buffer( 0 ) catch _:_Reason->{exit, _Reason} end of
-    Buffer when is_list( Buffer )->
-      State1 = do_send(Buffer, State),
-      worker_loop( State1 );
-    {exit, Reason}->
-      % TODO. Handle active monitors
-      exit( Reason )
-  end.
+worker_loop( Remote )->
+  Requests = collect_requests( _Count = 0 ),
+  catch Remote ! {batch, node(), Requests},
+  worker_loop( Remote ).
 
-
-collect_buffer( Count ) when Count < ?BATCH_SIZE->
-  Timeout =
-    if
-      Count =:= 0-> infinity;
-      true -> 0
-    end,
+collect_requests( Count ) when 0 < Count, Count < ?BATCH_SIZE->
   receive
-    {do, Request}->
-      [Request | collect_buffer( Count + 1 )];
-    {'EXIT', _, Reason} ->
-      throw( Reason )
+    {do, Request}-> [Request| collect_requests( Count + 1)]
   after
-    Timeout -> []
-  end.
-
-do_send(Buffer, #state{ remote = Remote } = State)->
-  catch Remote ! {batch, node(), Buffer},
-  State.
+    0 -> []
+  end;
+collect_requests( _Count = 0 )->
+  receive
+    {do, Request}-> [Request| collect_requests( 1 )]
+  end;
+collect_requests( _Count )->
+  [].
 
 %%=================================================================
 %% UTILITIES
 %%=================================================================
 get_proxy({ Service, Node }) ->
-  case persistent_term:get(?MODULE, undefined) of
-    #{ Node := Connection }->
-      { pick_worker( Connection ), Service};
-    _ ->
-      undefined
+  case get_node_proxy( Node ) of
+    undefined ->
+      undefined;
+    Proxy ->
+      { Proxy, Service }
   end;
 get_proxy( To ) when is_pid( To )->
-  Node = node( To ),
-  case persistent_term:get(?MODULE, undefined) of
-    #{ Node := Connection }->
-      { pick_worker( Connection ), To};
-    _ ->
-      undefined
+  case get_node_proxy( node(To) ) of
+    undefined ->
+      undefined;
+    Proxy ->
+      { Proxy, To }
   end;
 get_proxy( _To )->
   undefined.
+
+get_node_proxy( Node )->
+  case persistent_term:get(?MODULE, undefined) of
+    #{ Node := Connection }->
+      pick_worker( Connection );
+    _ ->
+      undefined
+  end.
 
 pick_worker( #connection{ counter = Counter, pool = Pool } )->
   Size = map_size( Pool ),
