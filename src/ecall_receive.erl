@@ -79,7 +79,7 @@ handle_batch([{send, To, Message}| Rest], State)->
   catch To ! Message,
   handle_batch( Rest, State );
 handle_batch([{call, Ref, ClientPID,  Module, Function, Args}| Rest], #state{ref2pid = R2P, pid2ref = P2R} = State)->
-  PID =
+  {PID,_} =
     spawn_monitor(fun()->
       Result = apply(Module, Function, Args),
       ecall_connection:send( ClientPID, {Ref, Result} )
