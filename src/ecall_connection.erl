@@ -64,7 +64,7 @@ call(Node, Module, Function, Args)->
           {'DOWN', Ref, process, _, Reason}->{error,{badrpc, Reason}}
         end
       after
-        erlang:demonitor(Ref, flush)
+        erlang:demonitor(Ref, [flush])
       end
   end.
 
