@@ -2,6 +2,7 @@
  [{description, "erlang library for group remote calls and casts"},
   {vsn, git},
   {registered, []},
+  {mod, {ecall_app, []}},
   {applications,
    [kernel,
     stdlib
