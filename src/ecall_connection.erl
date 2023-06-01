@@ -8,6 +8,7 @@
 %%=================================================================
 -export([
   send/2,
+  cast/4,
   call/4
 ]).
 
@@ -38,6 +39,14 @@ send( To, Message )->
       Message
   end.
 
+cast(Node, Module, Function, Args)->
+  case get_node_proxy( Node ) of
+    undefined ->
+      erpc:cast( Node, Module, Function, Args );
+    Proxy ->
+      Proxy ! {do, {cast, Module, Function, Args}},
+      ok
+  end.
 
 % Make a reference and send:
 %   {do, {call, Ref, self(), M, F, As}}
@@ -52,7 +61,14 @@ send( To, Message )->
 call(Node, Module, Function, Args)->
   case get_node_proxy( Node ) of
     undefined ->
-      ecall_erpc:call( Node, Module, Function, Args );
+      try {ok, erpc:call(Node, Module, Function, Args)}
+      catch
+        throw:Error -> {error, Error};
+        exit:{_,Reason} -> {error,{exit, Reason}};
+        error:{exception, Error, _Stack}-> {error, {exit,Error}};
+        error:{erpc, Reason}->{error,{badrpc, Reason}};
+        _:Error-> {error,{unexpected, Error}}
+      end;
     Proxy ->
       Ref = erlang:monitor( process, Proxy ),
       try
