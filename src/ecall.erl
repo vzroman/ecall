@@ -8,6 +8,8 @@
 %%=================================================================
 -export([
   send/2,
+  cast/4,
+  call/4,
 
   call_one/4,call_one/5,
   call_any/4,call_any/5,
@@ -25,10 +27,16 @@
   end).
 
 %===========================================================
-%   SEND
+%   SINGLE NODE API
 %===========================================================
 send(To, Message)->
   ecall_connection:send(To, Message).
+
+cast( Node, Module, Function, Args )->
+  ecall_connection:call( Node, Module, Function, Args ).
+
+call( Node, Module, Function, Args )->
+  ecall_connection:call( Node, Module, Function, Args ).
 
 %===========================================================
 %   CALLS
