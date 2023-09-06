@@ -55,7 +55,7 @@ call_one(Ns,M,F,As,RpcErr) ->
           ?LOGDEBUG("~p ok ~p",[N,Result]),
           {ok,{N,Result}};
         {error,Error}->
-          ?LOGERROR("~p error ~p",[N,Error]),
+          ?LOGDEBUG("~p error ~p",[N,Error]),
           call_one( Ns --[N], M, F, As, [{N,Error}], RpcErr)
       end;
     false->
@@ -75,10 +75,10 @@ call_one( Ns,M,F,As,Errors,RpcErr)->
       Errors1 =
         case Error of
           {badrpc, Reason} when not RpcErr ->
-            ?LOGWARNING("~p badrpc ~p",[N,Reason]),
+            ?LOGDEBUG("~p badrpc ~p",[N,Reason]),
             Errors;
           _->
-            ?LOGERROR("~p error ~p",[N,Error]),
+            ?LOGDEBUG("~p error ~p",[N,Error]),
             [{N,Error} | Errors]
         end,
       call_one( Ns --[N], M, F, As, Errors1, RpcErr)
@@ -99,7 +99,7 @@ call_any(Ns,M,F,As,RpcErr)->
           cast_all(Ns -- [N], M, F, As),
           {ok,{N,Result}};
         {error,Error}->
-          ?LOGERROR("~p error ~p",[N,Error]),
+          ?LOGDEBUG("~p error ~p",[N,Error]),
           do_call_any( Ns --[N], M, F, As, [{N,Error}], RpcErr)
       end;
     false->
@@ -131,10 +131,10 @@ wait_any(Owner, WaitFor, Errors, RpcErr) when WaitFor > 0 ->
       Errors1 =
         case Error of
           {badrpc, Reason} when not RpcErr->
-            ?LOGWARNING("~p badrpc ~p",[N,Reason]),
+            ?LOGDEBUG("~p badrpc ~p",[N,Reason]),
             Errors;
           _->
-            ?LOGERROR("~p error ~p",[N,Error]),
+            ?LOGDEBUG("~p error ~p",[N,Error]),
             [{N, Error} | Errors]
         end,
       wait_any(Owner, WaitFor-1,Errors1,RpcErr)
@@ -176,10 +176,10 @@ wait_all(Owner, WaitFor, OKs, RpcErr) when WaitFor > 0 ->
     {N,{error,Error}}->
       case Error of
         {badrpc, Reason} when not RpcErr ->
-          ?LOGWARNING("~p badrpc ~p",[N,Reason]),
+          ?LOGDEBUG("~p badrpc ~p",[N,Reason]),
           wait_all(Owner,WaitFor-1,OKs,RpcErr);
         _->
-          ?LOGERROR("~p error ~p",[N,Error]),
+          ?LOGDEBUG("~p error ~p",[N,Error]),
           Owner ! {error,self(), {N,Error}}
       end
   end;
@@ -215,7 +215,7 @@ wait_all_wait(Owner, WaitFor, Replies, Rejects) when WaitFor > 0 ->
       ?LOGDEBUG("~p result ~p",[N,Result]),
       wait_all_wait(Owner, WaitFor-1,[{N,Result}|Replies],Rejects);
     {N,{error,E}}->
-      ?LOGERROR("~p error ~p",[N,E]),
+      ?LOGDEBUG("~p error ~p",[N,E]),
       wait_all_wait(Owner, WaitFor-1,Replies,[{N,E}|Rejects])
   end;
 wait_all_wait(Owner, _WaitFor=0, Replies, Rejects)->
