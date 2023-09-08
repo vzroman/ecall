@@ -61,7 +61,11 @@ cast(Node, Module, Function, Args)->
 call(Node, Module, Function, Args)->
   case get_node_proxy( Node ) of
     undefined ->
-      try {ok, erpc:call(Node, Module, Function, Args)}
+      try
+        case erpc:call(Node, Module, Function, Args) of
+          {error,_}=CallError -> CallError;
+          CallResult -> {ok, CallResult}
+        end
       catch
         throw:Error -> {error, Error};
         exit:{_,Reason} -> {error,{exit, Reason}};
