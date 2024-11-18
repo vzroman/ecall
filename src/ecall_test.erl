@@ -11,7 +11,7 @@
   pool_tcp_send/3, pool_tcp_listen/1
 ]).
 
--define(LOG(Text,Params),lager:info(Text,Params)).
+-define(LOG(Text,Params),logger:info(Text,Params)).
 
 -define(LOG_COUNT, 100).
 -define(TS, erlang:system_time(millisecond)).

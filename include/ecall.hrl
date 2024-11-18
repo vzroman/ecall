@@ -17,9 +17,9 @@
 
 %---------------logging------------------------------------------------
 -define(T,atom_to_list(?FUNCTION_NAME)++": ").
--define(LOGDEBUG(Text,Params),lager:debug(?T++Text,Params)).
--define(LOGINFO(Text,Params),lager:info(?T++Text,Params)).
--define(LOGWARNING(Text,Params),lager:warning(?T++Text,Params)).
--define(LOGERROR(Text,Params),lager:error(?T++Text,Params)).
+-define(LOGDEBUG(Text,Params),logger:debug(?T++Text,Params)).
+-define(LOGINFO(Text,Params),logger:info(?T++Text,Params)).
+-define(LOGWARNING(Text,Params),logger:warning(?T++Text,Params)).
+-define(LOGERROR(Text,Params),logger:error(?T++Text,Params)).
 
 -endif.
