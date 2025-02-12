@@ -47,9 +47,8 @@ start_connection( Node )->
   end.
 
 stop_connection( Node )->
-  case supervisor:terminate_child(?MODULE, Node) of
-    ok -> ok;
-    {'error', not_found}-> ok;
-    {error, Error} -> throw( Error )
-  end.
+  supervisor:terminate_child(?MODULE, Node),
+  supervisor:delete_child( ?MODULE, Node),
+  ok.
+
 
