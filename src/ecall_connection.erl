@@ -94,77 +94,64 @@ call(Node, Module, Function, Args)->
 %% SERVICE API
 %%=================================================================
 connect( Node )->
-  case persistent_term:get(?MODULE, #{}) of
-    #{Node := _}->
-      throw( already_connected );
-    _->
-      case supervisor:start_child(ecall_connection_sup,[Node]) of
-        {ok,_}-> ok;
-        {error,Error} -> throw(Error)
-      end
-  end.
+  unregister_connection( Node ),
+  ecall_connection_sup:start_connection( Node ).
 
 disconnect( Node )->
-  case persistent_term:get(?MODULE, #{}) of
-    #{Node := #connection{master = Master}}->
-      case supervisor:terminate_child(ecall_connection_sup, Master) of
-        ok -> ok;
-        {error, Error} -> throw( Error )
-      end;
-    _->
-      throw( not_connected )
-  end.
+  unregister_connection( Node ),
+  ecall_connection_sup:stop_connection( Node ).
 
 %%=================================================================
 %% OTP API
 %%=================================================================
 start_link( Node )->
-
   Sup = self(),
   Master = spawn_link(fun()->init_connection(Node, Sup) end),
   receive
-    {ready, Master}-> {ok, Master};
+    {ready, Master}->
+      {ok, Master};
     {error, Master, Error}->
       {error, Error}
   end.
 
 init_connection(Node, Sup)->
 
-  process_flag(trap_exit,true),
+  unregister_connection( Node ),
 
-  Self = self(),
-
-  Ref = make_ref(),
-  {ecall_receive, Node} ! {get_workers, Ref, self()},
-
-  receive
-    {Ref, Workers}->
+  case get_remote_workers(Node) of
+    {ok, Workers}->
       Counter = atomics:new(1,[{signed,false}]),
       Pool =
         maps:from_list([ {I,spawn_link(fun()->worker_loop(W) end)} || {I, W} <- lists:zip( lists:seq(0, length(Workers)-1), Workers) ]),
-      Connections = persistent_term:get( ?MODULE, #{}),
 
-      Connection = #connection{node = Node, master = Self, pool = Pool, counter = Counter },
-      persistent_term:put(?MODULE, Connections#{ Node => Connection }),
+      Connection = #connection{node = Node, master = self(), pool = Pool, counter = Counter },
+      register_connection( Node, Connection ),
 
-      Sup ! {ready, Self},
+      Sup ! {ready, self()},
 
-      master_loop( Connection )
-
-  after
-    ?CONNECT_TIMEOUT->
+      timer:sleep(infinity);
+    {error, Error}->
       unlink(Sup),
-      Sup ! {error, Self, connect_timeout}
+      Sup ! {error, self(), Error}
   end.
 
-master_loop( #connection{node = Node} = Connection )->
+register_connection( Node, Connection )->
+  Connections = persistent_term:get( ?MODULE, #{}),
+  persistent_term:put(?MODULE, Connections#{ Node => Connection }),
+  ok.
+
+unregister_connection( Node )->
+  Connections = persistent_term:get( ?MODULE, #{}),
+  persistent_term:put(?MODULE, maps:remove( Node, Connections )),
+  ok.
+
+get_remote_workers( Node )->
+  Ref = make_ref(),
+  {ecall_receive, Node} ! {get_workers, Ref, self()},
   receive
-    {'EXIT',_, Reason}->
-      Connections = persistent_term:get( ?MODULE, #{}),
-      persistent_term:put(?MODULE, maps:remove( Node, Connections )),
-      exit( Reason );
-    _->
-      master_loop( Connection )
+    {Ref, Workers}-> {ok, Workers}
+  after
+    ?CONNECT_TIMEOUT->{error, timeout}
   end.
 
 %%=================================================================
