@@ -5,6 +5,9 @@ compile:
 test_load: compile
 	./rebar3 ct --spec=./test/load.spec
 
+test_as_peer: compile
+	./rebar3 ct --spec=./test/as_peer.spec
+
 clean_logs:
 	rm -rf logs
 
