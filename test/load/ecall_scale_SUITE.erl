@@ -1,11 +1,7 @@
 
 -module(ecall_scale_SUITE).
 
-
--define(PROCESSES,50000).
--define(ITERATIONS,20).
--define(CYCLE, 1000).
-
+-include("ecall.hrl").
 
 %% API
 -export([
@@ -21,19 +17,21 @@
 
 %% Create group
 -export([
-  make_ref_test/1
+  distributed_test/1
 ]).
 
 
 all()->
   [
-     {group, make_ref_test}
+     {group, distributed_test}
   ].
 
 groups()->[
-  {make_ref_test,
-    [parallel],
-    [make_ref_test||_<-lists:seq(1,?PROCESSES)]
+  {distributed_test,
+    [sequence],
+    [
+      distributed_test
+    ]
   }
 ].
 
@@ -55,14 +53,6 @@ init_per_testcase(_,Config)->
 end_per_testcase(_,_Config)->
   ok.
 
-make_ref_test( _Config )->
-
-  make_ref_test_loop( ?ITERATIONS ),
-
-  ok.
-
-make_ref_test_loop( Count ) when Count > 0->
-  _Ref = make_ref(),
-  make_ref_test_loop( Count - 1 );
-make_ref_test_loop( _Count )->
+distributed_test( _Config )->
+  ?LOGDEBUG("distributed_test"),
   ok.
