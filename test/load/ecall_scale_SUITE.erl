@@ -46,6 +46,7 @@ init_per_suite(Config)->
 end_per_suite( Config )->
   Nodes = proplists:get_value(nodes, Config),
   stop_nodes( Nodes ),
+  remove_image(),
   ok.
 
 init_per_group(_,Config)->
@@ -73,28 +74,34 @@ build_image(Config)->
   Sources = filename:join(PrivDir, "src"),
   CopySrc = lists:join(" && ",[
     "mkdir "++Sources,
+    "cp -R "++ProjectRoot++"/config "++Sources++"/",
     "cp -R "++ProjectRoot++"/include "++Sources++"/",
     "cp -R "++ProjectRoot++"/src "++Sources++"/",
     "cp -R "++ProjectRoot++"/test "++Sources++"/",
     "cp -R "++ProjectRoot++"/rebar3 "++Sources++"/",
-    "cp -R "++ProjectRoot++"/rebar.config "++Sources++"/",
-    "cp -R "++ProjectRoot++"/run_as_peer "++Sources++"/"
+    "cp -R "++ProjectRoot++"/rebar.config "++Sources++"/"
   ]),
   ?LOGDEBUG("CopySrc ~p",[CopySrc]),
   os:cmd( CopySrc ,#{ exception_on_failure => true }),
 
   Dockerfile = lists:join("\n",[
     "FROM vzroman/erlang_otp:v27.2.3",
+    "EXPOSE 4445\n"
     "ENV SRC=/opt/ecall",
+    "ENV ERL_FLAGS=\"-args_file config/vm.args -config config/sys.config\"",
     "RUN mkdir $SRC",
     "COPY ./src $SRC/",
     "WORKDIR $SRC",
-    "ENTRYPOINT [ \"./run_as_peer\" ]"
+    "ENTRYPOINT [ \"./rebar3\", \"as\", \"test\", \"shell\" ]"
   ]),
   ?LOGDEBUG("Dockerfile ~p",[Dockerfile]),
   ok = file:write_file(filename:join(PrivDir, "Dockerfile"), Dockerfile),
   os:cmd("docker build -t ecall " ++ PrivDir, #{ exception_on_failure => true }).
 
+remove_image()->
+  os:cmd("docker stop $(docker ps -a --filter \"ancestor=ecall\" --format \"{{.ID}}\") && docker rm $(docker ps -a --filter \"ancestor=ecall\" --format \"{{.ID}}\")"),
+  os:cmd("docker rmi ecall"),
+  ok.
 
 start_nodes( Count  )->
   lists:foldl(
@@ -103,13 +110,26 @@ start_nodes( Count  )->
       Acc#{ Node => Peer }
     end, #{}, lists:seq(1,Count) ).
 
-start_node( Name )->
+start_node( Host )->
   Docker = os:find_executable("docker"),
-  {ok, Peer, Node} = ecall_peer:start(#{name => list_to_atom("ecall@"++Name),
+  {ok, Peer, Node} = ecall_peer:start(#{
+    name => "ecall",
+    host => Host,
+    longnames => true,
     connection => standard_io,
-    exec => {Docker, ["run", "-h", Name, "-i", "ecall"]}}),
+    post_process_args => fun to_rebar_args/1,
+    exec => {Docker, ["run", "-h", Host, "-i", "ecall"]}}),
 
   {Node, Peer}.
+
+to_rebar_args(["-name", Name|Rest])->
+  ["--name", Name | to_rebar_args(Rest)];
+to_rebar_args(["-user", _User|Rest])->
+  to_rebar_args(Rest);
+to_rebar_args([Option|Rest])->
+  [Option|to_rebar_args(Rest)];
+to_rebar_args([])->
+  [].
 
 connect_nodes(Nodes)->
   inet_db:set_lookup([file]),

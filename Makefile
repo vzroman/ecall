@@ -5,14 +5,19 @@ compile:
 test_load: compile
 	./rebar3 ct --spec=./test/load.spec
 
-test_as_peer: compile
-	./rebar3 ct --spec=./test/as_peer.spec
+peer: compile
+	ERL_FLAGS="-args_file config/vm.args -config config/sys.config" ./rebar3 as test shell
 
 clean_logs:
 	rm -rf logs
 
 clean_tests:
 	rm -rf _build/test
+
+clean_docker:
+	docker stop $(docker ps -a --filter "ancestor=ecall" -q)
+	docker rm $(docker ps -a --filter "ancestor=ecall" -q)
+	docker rmi ecall
 
 clean_build:
 	rm -rf _build

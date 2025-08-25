@@ -57,6 +57,7 @@
 
 
 erpc_call( Node, Count )->
+  ecall_as_peer_SUITE:just_sleep(undefined),
   ?LOG("call test start node ~p count ~p",[ Node, Count ]),
   [ spawn(fun()-> do_erpc_call(Node, ?LOG_COUNT, ?TS) end)  || _ <- lists:seq(1,Count)],
   ok.

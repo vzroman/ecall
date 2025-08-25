@@ -1,2 +1,2 @@
 #!/bin/sh
-./rebar3 ct --spec=./test/as_peer.spec
+./rebar3 as test shell
