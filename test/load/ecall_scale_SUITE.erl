@@ -84,11 +84,13 @@ build_image(Config)->
   ?LOGDEBUG("CopySrc ~p",[CopySrc]),
   os:cmd( CopySrc ,#{ exception_on_failure => true }),
 
+%%  peer:start_link(),
+
   Dockerfile = lists:join("\n",[
     "FROM vzroman/erlang_otp:v27.2.3",
     "EXPOSE 4445\n"
     "ENV SRC=/opt/ecall",
-    "ENV ERL_FLAGS=\"-args_file config/vm.args -config config/sys.config\"",
+    "ENV ERL_FLAGS=\"-args_file config/vm.args -config config/sys.config -user peer\"",
     "RUN mkdir $SRC",
     "COPY ./src $SRC/",
     "WORKDIR $SRC",
@@ -136,11 +138,16 @@ connect_nodes(Nodes)->
 
   maps:foreach(
     fun(Node, Peer)->
+      ?LOGDEBUG("try connect node ~p",[Node]),
       {ok, Ips} = peer:call(Peer, inet, getifaddrs, []),
+      ?LOGDEBUG("node ~p ips: ~p",[Node, Ips]),
       {"eth0", Eth0} = lists:keyfind("eth0", 1, Ips),
+      ?LOGDEBUG("node ~p eth0: ~p",[Node, Eth0]),
       {addr, Ip} = lists:keyfind(addr, 1, Eth0),
-      [_,Host] = lists:split( atom_to_list(Node), "@" ),
-      inet_db:add_host(Ip, [Host]),
+      ?LOGDEBUG("node ~p ip: ~p",[Node, Ip]),
+      [_,Host] = string:split( atom_to_list(Node), "@" ),
+      ?LOGDEBUG("node ~p Host: ~p",[Node, Host]),
+      ok = inet_db:add_host(Ip, [Host]),
       true = net_kernel:connect_node(Node),
       ?LOGDEBUG("~p nodes: ~p",[Node, peer:call(Peer, erlang, nodes, [])])
     end, Nodes).
