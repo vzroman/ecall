@@ -79,7 +79,8 @@ build_image(Config)->
     "cp -R "++ProjectRoot++"/src "++Sources++"/",
     "cp -R "++ProjectRoot++"/test "++Sources++"/",
     "cp -R "++ProjectRoot++"/rebar3 "++Sources++"/",
-    "cp -R "++ProjectRoot++"/rebar.config "++Sources++"/"
+    "cp -R "++ProjectRoot++"/rebar.config "++Sources++"/",
+    "sed -i 's/^-name/##-name/' "++Sources++"/config/vm.args"
   ]),
   ?LOGDEBUG("CopySrc ~p",[CopySrc]),
   os:cmd( CopySrc ,#{ exception_on_failure => true }),
@@ -90,8 +91,8 @@ build_image(Config)->
     "FROM vzroman/erlang_otp:v27.2.3",
     "EXPOSE 4445\n"
     "ENV SRC=/opt/ecall",
+    "ENV ERL_FLAGS=\"-args_file config/vm.args -config config/sys.config -user peer\"",
 %%    "ENV ERL_FLAGS=\"-args_file config/vm.args -config config/sys.config\"",
-%%    "ENV ERL_FLAGS=\"-args_file config/vm.args -config config/sys.config -user peer\"",
     "RUN mkdir $SRC",
     "COPY ./src $SRC/",
     "WORKDIR $SRC",
@@ -121,22 +122,12 @@ start_node( Host )->
     longnames => true,
     connection => standard_io,
     post_process_args => fun to_rebar_args/1,
-    exec => {Docker, [
-      "run",
-      "-e","ERL_FLAGS=\"-name","ecall@"++Host,
-      "-name","ecall@"++Host,
-      "-user","peer",
-      "-args_file","config/vm.args",
-      "-config","config/sys.config\"",
-%%      "-e","ERL_FLAGS=-user peer",
-      "-h", Host,
-      "-i", "ecall"
-    ]}}),
+    exec => {Docker, ["run", "-h", Host, "-i", "ecall"]}}),
 
   {Node, Peer}.
 
-to_rebar_args(["-name", _Name|Rest])->
-  to_rebar_args(Rest);
+to_rebar_args(["-name", Name|Rest])->
+  ["--name",Name|to_rebar_args(Rest)];
 to_rebar_args(["-user", _User|Rest])->
   to_rebar_args(Rest);
 to_rebar_args([Option|Rest])->
