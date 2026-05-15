@@ -178,14 +178,14 @@ collect_requests( _Count )->
 %% UTILITIES
 %%=================================================================
 get_proxy({ Service, Node }) ->
-  case get_node_proxy( Node ) of
+  case get_node_proxy( Node, Service ) of
     undefined ->
       undefined;
     Proxy ->
       { Proxy, Service }
   end;
 get_proxy( To ) when is_pid( To )->
-  case get_node_proxy( node(To) ) of
+  case get_node_proxy( node(To), To ) of
     undefined ->
       undefined;
     Proxy ->
@@ -195,13 +195,15 @@ get_proxy( _To )->
   undefined.
 
 get_node_proxy( Node )->
+  get_node_proxy(Node, self()).
+get_node_proxy( Node, PID )->
   case persistent_term:get(?MODULE, undefined) of
     #{ Node := Connection }->
-      pick_worker( Connection );
+      pick_worker( Connection, PID );
     _ ->
       undefined
   end.
 
-pick_worker(#connection{ size = Size, pool = Pool })->
-  I = erlang:phash2(self(), Size),
+pick_worker(#connection{ size = Size, pool = Pool }, PID)->
+  I = erlang:phash2(PID, Size),
   maps:get(I, Pool ).
