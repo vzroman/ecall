@@ -89,7 +89,7 @@ call(Node, Module, Function, Args)->
   end.
 
 
--record(connection,{ node, master, pool, counter }).
+-record(connection,{ node, master, pool, size }).
 %%=================================================================
 %% SERVICE API
 %%=================================================================
@@ -120,11 +120,10 @@ init_connection(Node, Sup)->
 
   case get_remote_workers(Node) of
     {ok, Workers}->
-      Counter = atomics:new(1,[{signed,false}]),
       Pool =
         maps:from_list([ {I,spawn_link(fun()->worker_loop(W) end)} || {I, W} <- lists:zip( lists:seq(0, length(Workers)-1), Workers) ]),
 
-      Connection = #connection{node = Node, master = self(), pool = Pool, counter = Counter },
+      Connection = #connection{node = Node, master = self(), pool = Pool, size = map_size(Pool) },
       register_connection( Node, Connection ),
 
       Sup ! {ready, self()},
@@ -203,15 +202,6 @@ get_node_proxy( Node )->
       undefined
   end.
 
-pick_worker( #connection{ counter = Counter, pool = Pool } )->
-  Size = map_size( Pool ),
-
-  I = atomics:add_get( Counter, 1, 1 ),
-  Index = (I rem Size),
-
-  if
-    I =:= Size -> atomics:sub(Counter,1, Size);
-    true -> ignore
-  end,
-
-  maps:get( Index, Pool ).
+pick_worker(#connection{ size = Size, pool = Pool })->
+  I = erlang:phash2(self(), Size),
+  maps:get(I, Pool ).
