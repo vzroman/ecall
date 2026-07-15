@@ -33,7 +33,7 @@ send(To, Message)->
   ecall_connection:send(To, Message).
 
 cast( Node, Module, Function, Args )->
-  ecall_connection:call( Node, Module, Function, Args ).
+  ecall_connection:cast( Node, Module, Function, Args ).
 
 call( Node, Module, Function, Args )->
   ecall_connection:call( Node, Module, Function, Args ).
