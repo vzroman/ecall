@@ -17,7 +17,8 @@
 %% TEST CASES
 %%=================================================================
 -export([
-  sender_pid_routes_all_entry_points/1
+  sender_pid_routes_all_entry_points/1,
+  ecall_api_delegates_to_connection/1
 ]).
 
 -record(connection, { node, master, pool, size }).
@@ -27,7 +28,8 @@
 %%=================================================================
 all() ->
   [
-    sender_pid_routes_all_entry_points
+    sender_pid_routes_all_entry_points,
+    ecall_api_delegates_to_connection
   ].
 
 init_per_suite(Config) ->
@@ -46,13 +48,19 @@ end_per_testcase(_, _Config) ->
 %% TEST CASES
 %%=================================================================
 sender_pid_routes_all_entry_points(_Config) ->
+  run_route_test(ecall_connection).
+
+ecall_api_delegates_to_connection(_Config) ->
+  run_route_test(ecall).
+
+run_route_test(ApiModule) ->
   Parent = self(),
   Node = node(),
   Size = 16,
   Pool = route_test_pool(Parent, Size),
   OldConnections = persistent_term:get(ecall_connection, undefined),
   Sender =
-    spawn(fun() -> route_test_sender(Parent, Node) end),
+    spawn(fun() -> route_test_sender(Parent, Node, ApiModule) end),
 
   wait_for({route_test_ready, Sender}),
   TargetPid = route_test_target_pid(Size, Sender),
@@ -107,19 +115,19 @@ route_test_proxy(Parent, Index) ->
       ok
   end.
 
-route_test_sender(Parent, Node) ->
+route_test_sender(Parent, Node, ApiModule) ->
   Parent ! {route_test_ready, self()},
   receive
     {route_test_run, TargetPid} ->
       TupleSend =
-        ecall_connection:send({TargetPid, Node}, route_test_tuple_message),
-      PidSend = ecall_connection:send(TargetPid, route_test_pid_message),
+        ApiModule:send({TargetPid, Node}, route_test_tuple_message),
+      PidSend = ApiModule:send(TargetPid, route_test_pid_message),
       Cast =
-        ecall_connection:cast(Node, route_test_module, route_test_function,
-                              [route_test_arg]),
+        ApiModule:cast(Node, route_test_module, route_test_function,
+                       [route_test_arg]),
       Call =
-        ecall_connection:call(Node, route_test_module, route_test_function,
-                              [route_test_arg]),
+        ApiModule:call(Node, route_test_module, route_test_function,
+                       [route_test_arg]),
       Parent ! {route_test_done, self(), TupleSend, PidSend, Cast, Call}
   end.
 
