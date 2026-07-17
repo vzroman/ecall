@@ -7,8 +7,218 @@ The tests compare receiver-confirmed throughput for raw distributed sends,
 increase load until throughput reaches a ceiling or collapses, then correlate
 the result with distribution-lock, network, and batching metrics.
 
-Topology, orchestration, run duration, repetition, and implementation are not
-defined yet.
+The implementation uses Common Test as the single orchestration entry point.
+The Common Test controller runs on the host where the user starts the suite.
+Participant roles run as peer-started Erlang nodes inside Docker containers.
+The passive role nodes have the same compiled modules as the controller; the
+controller decides which exported role procedure runs on which node.
+
+The default topology has three Erlang nodes:
+
+- controller: the Common Test node started by `rebar3 ct`;
+- sender: a Docker-backed peer node that generates load;
+- receiver: a Docker-backed peer node that owns final targets and counters.
+
+`sender` and `receiver` may both run locally, or either role may run on a
+remote Docker host over SSH. Containers do not run Common Test groups or specs.
+Only the controller runs Common Test.
+
+## Implementation layout
+
+Performance test implementation lives under `test/performance/`.
+
+- `test/performance/test.spec` is the Common Test spec file.
+- `test/performance/performance.config` is the local default role config.
+- `test/performance/performance.example.config` documents remote role config.
+- `test/performance/Dockerfile` defines the role-node image.
+- `test/performance/distributed_tests_util.erl` owns role config parsing,
+  Docker image build, local and remote container startup, peer startup,
+  node connection, and cleanup.
+- Real workload suites live under `test/performance/` and call
+  `distributed_tests_util` from `init_per_suite/1`.
+- `perf_tests/spec.md` and `perf_tests/findings.md` are design documents, not
+  Common Test inputs.
+
+The Makefile target for normal execution is:
+
+```sh
+make performance_tests
+```
+
+It must compile the project and run:
+
+```sh
+./rebar3 ct --spec=./test/performance/test.spec
+```
+
+## Role configuration
+
+The Common Test config contains one `role_config` term:
+
+```erlang
+{role_config, #{
+  sender => local,
+  receiver => local
+}}.
+```
+
+A role location is either `local` or a remote host map:
+
+```erlang
+#{host => "host", user => "user", password => "password"}.
+```
+
+Remote role maps support these keys:
+
+- `host`: SSH host name or address.
+- `user`: SSH user.
+- `password`: optional SSH password. If omitted, SSH key or agent auth is used.
+- `port`: optional SSH port as a string. The default is `"22"`.
+- `node_host`: optional Erlang node host string. The default is `host`.
+
+`PERFORMANCE_TEST_CONFIG` may point at an external config file. That file may
+contain either `{role_config, Map}.` or a bare `Map.`. This is the required
+path for real remote credentials; credentials must not be committed to the
+repository.
+
+`distributed_tests_util:role_config/1` returns the normalized role map.
+If no CT config and no `PERFORMANCE_TEST_CONFIG` are present, the default is:
+
+```erlang
+#{sender => local, receiver => local}
+```
+
+The suite stores only sanitized role data in the Common Test `Config`. Passwords
+must not be inserted into `Config`, because remote spawn failures and CT logs
+can print the config value.
+
+## Orchestration lifecycle
+
+Every performance suite follows this lifecycle:
+
+```erlang
+init_per_suite(Config0) ->
+    RoleConfig = distributed_tests_util:role_config(Config0),
+    SenderNode = distributed_tests_util:start_node(sender, RoleConfig),
+    ReceiverNode = distributed_tests_util:start_node(receiver, RoleConfig),
+    ok = distributed_tests_util:connect(SenderNode, ReceiverNode),
+    [
+      {role_config, distributed_tests_util:public_role_config(RoleConfig)},
+      {sender, SenderNode},
+      {receiver, ReceiverNode}
+      | Config0
+    ].
+
+end_per_suite(_Config) ->
+    distributed_tests_util:stop_all().
+```
+
+`start_node(Role, RoleConfig)` must:
+
+- ensure the controller node is distributed and uses long node names;
+- create one cookie shared by the controller and all role nodes;
+- build or reuse the Docker image on the local host;
+- build or reuse the same Docker image on each remote Docker host;
+- start the role node with `peer` and Docker;
+- return the started Erlang node name.
+
+`connect(NodeA, NodeB)` must connect participant role nodes before tests spawn
+cross-node role procedures. `stop_all/0` must stop peers, remove local and
+remote containers, remove temporary password files, and clear utility state.
+
+## Docker and peer requirements
+
+The role-node image must contain the compiled application and test modules at
+`/opt/ecall`. Sender and receiver containers use the same image. There is no
+separate passive-node module or reduced runtime payload.
+
+The image name defaults to `ecall-performance:otp27`. The base image defaults
+to an OTP 27 Erlang image. The implementation must support these environment
+overrides:
+
+- `PERFORMANCE_IMAGE`: Docker image tag to build or reuse.
+- `PERFORMANCE_BASE_IMAGE`: Docker base image.
+- `PERFORMANCE_FORCE_IMAGE_BUILD`: when `1`, `true`, or `yes`, rebuild even if
+  the image already exists.
+- `PERFORMANCE_APP_DIR`: app directory to copy into the Docker build context.
+- `PERFORMANCE_CONTROLLER_NODE_HOST`: externally reachable host part for the
+  controller Erlang node.
+- `PERFORMANCE_LOCAL_NODE_HOST`: host part for local role node names.
+- `PERFORMANCE_DIST_PORT_BASE`: base distribution port.
+
+Containers run with host networking. The controller distribution port is the
+base port, `sender` uses base + 1, and `receiver` uses base + 2. Additional
+roles, if added later, must use deterministic offsets that do not collide with
+these ports.
+
+Remote Docker hosts are accessed through SSH. If a remote role config includes
+`password`, the runner may use `sshpass`, but the password must be passed in a
+way that does not appear in peer options, environment dumps, command output, or
+CT `Config`.
+
+Remote image build streams the local app build context to `docker build` on the
+remote host. The remote host is not required to have the repository checkout,
+only SSH access and Docker.
+
+## Suite and role procedure contract
+
+The controller test case is responsible for orchestration. Role procedures are
+ordinary exported functions in the same Common Test suite module or a helper
+module available on every role node.
+
+Test cases must spawn role procedures with `spawn_monitor/4`:
+
+```erlang
+{ReceiverPid, ReceiverMon} =
+  spawn_monitor(ReceiverNode, ?MODULE, receiver_role, [self(), Config]),
+{SenderPid, SenderMon} =
+  spawn_monitor(SenderNode, ?MODULE, sender_role, [self(), Config]).
+```
+
+Role procedures must send readiness and result messages to the controller.
+Unexpected role failures are reported by the monitor `DOWN` message; role
+procedures must not use a separate `{self(), failed, Reason}` protocol.
+
+The controller starts measurement only after all participating role procedures
+have reported readiness. Throughput is counted from receiver-confirmed results
+or completed replies, not from sender-side enqueue acceptance.
+
+The role procedures may receive the Common Test `Config`, but the stored config
+must be safe to print and safe to ship to remote nodes.
+
+## Run controls
+
+Each steady-state measurement point uses these defaults unless overridden by CT
+config:
+
+- warm-up duration: 5 seconds;
+- measurement duration: 30 seconds;
+- post-stop drain timeout: 10 seconds;
+- repetitions for reportable runs: 3;
+- repetitions for smoke or development runs: 1.
+
+Every report row must include the actual warm-up duration, measurement duration,
+drain timeout, and repetition index used for that row.
+
+H2 is completion-based rather than duration-based. It uses the same warm-up and
+drain concepts for setup and shutdown, but its primary duration is the measured
+time required to deliver exactly 1M messages.
+
+## Implementation acceptance criteria
+
+Before the workload cases are implemented, the orchestration layer must pass a
+smoke suite that proves:
+
+- default local/local role config starts sender and receiver containers;
+- an external config can place one role on a remote Docker host;
+- the controller can spawn monitored procedures on both role nodes;
+- the role nodes can exchange messages;
+- the controller receives role readiness and result messages;
+- `end_per_suite/1` removes containers and temporary password files;
+- remote credentials are not written into tracked files or CT `Config`.
+
+Workload implementation may start only after this smoke suite passes for
+local/local and for one local/remote topology.
 
 ## Common workload
 
