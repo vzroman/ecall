@@ -2,7 +2,10 @@
 
 {config, "performance.config"}.
 
+{include, 'PERFORMANCE_TEST', ["util"]}.
+
 {suites, 'PERFORMANCE_TEST', [
-    performance_config_SUITE,
-    performance_workload_SUITE
+    performance_send_SUITE,
+    performance_cast_SUITE,
+    performance_call_SUITE
 ]}.
