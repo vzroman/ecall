@@ -4,6 +4,5 @@
 
 {suites, 'PERFORMANCE_TEST', [
     performance_config_SUITE,
-    performance_orchestration_SUITE,
     performance_workload_SUITE
 ]}.

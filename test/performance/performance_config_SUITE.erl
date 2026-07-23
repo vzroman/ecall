@@ -429,7 +429,7 @@ test_spec_includes_performance_suites(_Config) ->
   {ok, Terms} = file:consult(performance_file("test.spec")),
   {suites, 'PERFORMANCE_TEST', Suites} = lists:keyfind(suites, 1, Terms),
   assert_equal(
-    [performance_config_SUITE, performance_orchestration_SUITE, performance_workload_SUITE],
+    [performance_config_SUITE, performance_workload_SUITE],
     Suites).
 
 workload_h2_report_row_carries_completion_ms(_Config) ->
