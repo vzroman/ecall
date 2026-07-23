@@ -17,6 +17,7 @@
 %%=================================================================
 -export([
   connect/1,
+  connection_info/1,
   disconnect/1
 ]).
 
@@ -89,14 +90,49 @@ call(Node, Module, Function, Args)->
   end.
 
 
--record(connection,{ node, master, pool, size }).
+-record(connection,{
+  node,
+  master,
+  pool,
+  size,
+  batch_size
+}).
+
 %%=================================================================
 %% SERVICE API
 %%=================================================================
+-spec connect(node()) -> ok | {error, term()}.
 connect( Node )->
   unregister_connection( Node ),
   ecall_connection_sup:start_connection( Node ).
 
+-spec connection_info(node()) ->
+  {ok, #{
+    status := connected,
+    connection_pid := pid(),
+    proxy_count := pos_integer(),
+    batch_size := pos_integer()
+  }}
+  | {error, not_connected}.
+connection_info( Node )->
+  case persistent_term:get(?MODULE, #{}) of
+    #{ Node := Connection }->
+      #connection{
+        master = Master,
+        size = Size,
+        batch_size = BatchSize
+      } = Connection,
+      {ok, #{
+        status => connected,
+        connection_pid => Master,
+        proxy_count => Size,
+        batch_size => BatchSize
+      }};
+  _->
+      {error, not_connected}
+  end.
+
+-spec disconnect(node()) -> ok | {error, term()}.
 disconnect( Node )->
   unregister_connection( Node ),
   ecall_connection_sup:stop_connection( Node ).
@@ -104,6 +140,7 @@ disconnect( Node )->
 %%=================================================================
 %% OTP API
 %%=================================================================
+-spec start_link(node()) -> {ok, pid()} | {error, term()}.
 start_link( Node )->
   Sup = self(),
   Master = spawn_link(fun()->init_connection(Node, Sup) end),
@@ -120,10 +157,19 @@ init_connection(Node, Sup)->
 
   case get_remote_workers(Node) of
     {ok, Workers}->
+      BatchSize = application:get_env(ecall, batch_size, ?BATCH_SIZE),
       Pool =
-        maps:from_list([ {I,spawn_link(fun()->worker_loop(W) end)} || {I, W} <- lists:zip( lists:seq(0, length(Workers)-1), Workers) ]),
+        maps:from_list(
+          [ {I,spawn_link(fun()->worker_loop(W, BatchSize) end)}
+            || {I, W} <-
+                 lists:zip(lists:seq(0, length(Workers)-1), Workers) ]),
 
-      Connection = #connection{node = Node, master = self(), pool = Pool, size = map_size(Pool) },
+      Connection =
+        #connection{ node = Node,
+                     master = self(),
+                     pool = Pool,
+                     size = map_size(Pool),
+                     batch_size = BatchSize },
       register_connection( Node, Connection ),
 
       Sup ! {ready, self()},
@@ -156,22 +202,22 @@ get_remote_workers( Node )->
 %%=================================================================
 %% WORKER LOOP
 %%=================================================================
-worker_loop( Remote )->
-  Requests = collect_requests( _Count = 0 ),
+worker_loop( Remote, BatchSize )->
+  Requests = collect_requests( _Count = 0, BatchSize ),
   catch Remote ! {batch, node(), Requests},
-  worker_loop( Remote ).
+  worker_loop( Remote, BatchSize ).
 
-collect_requests( Count ) when 0 < Count, Count < ?BATCH_SIZE->
+collect_requests( Count, BatchSize ) when 0 < Count, Count < BatchSize->
   receive
-    {do, Request}-> [Request| collect_requests( Count + 1)]
+    {do, Request}-> [Request| collect_requests( Count + 1, BatchSize)]
   after
     0 -> []
   end;
-collect_requests( _Count = 0 )->
+collect_requests( _Count = 0, BatchSize )->
   receive
-    {do, Request}-> [Request| collect_requests( 1 )]
+    {do, Request}-> [Request| collect_requests( 1, BatchSize)]
   end;
-collect_requests( _Count )->
+collect_requests( _Count, _BatchSize )->
   [].
 
 %%=================================================================

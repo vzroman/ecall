@@ -17,7 +17,9 @@
   call_all_wait/4,
 
   cast_one/4,
-  cast_all/4
+  cast_all/4,
+
+  connection_info/1
 ]).
 
 -define(RAND(List),
@@ -236,5 +238,8 @@ cast_all(Ns,M,F,As)->
   ?LOGDEBUG("~p with ~p:~p(~p)",[Ns,M,F,As]),
   [ ecall_connection:cast(N, M, F, As) || N <- Ns ],
   ok.
+
+connection_info(Node)->
+  ecall_connection:connection_info(Node).
 
 

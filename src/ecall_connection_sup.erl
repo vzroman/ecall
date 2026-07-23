@@ -50,5 +50,3 @@ stop_connection( Node )->
   supervisor:terminate_child(?MODULE, Node),
   supervisor:delete_child( ?MODULE, Node),
   ok.
-
-
