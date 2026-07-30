@@ -34,7 +34,6 @@ under that directory; reusable modules are under `test/performance/util/`.
 test/performance/
   util/
     distributed_tests_utils.erl
-    performance_load_utils.erl
     performance_payloads.erl
   performance_send_SUITE.erl
   performance_cast_SUITE.erl
@@ -44,9 +43,12 @@ test/performance/
   Dockerfile
 ```
 
-Additional helpers belong under `util/`, not beside the suites. The build and
-Common Test code paths must compile `util/*.erl` and make all suite and utility
-BEAM files available to the controller, sender, and receiver nodes.
+`distributed_tests_utils` is only responsible for starting and stopping
+participating nodes, including node readiness before it returns. Workload
+orchestration is kept inside each suite, even where that repeats code. Payload
+construction remains centralized in `performance_payloads`. The build and
+Common Test code paths must make the suite and utility BEAM files available to
+the controller, sender, and receiver nodes.
 
 `perf_tests/spec.md` and `perf_tests/findings.md` are design documents, not
 Common Test inputs. A reporting module is not part of this phase.
@@ -91,19 +93,23 @@ The default `performance.config` is:
 {performance, #{
   pace_ms => 100,
   messages_per_writer => 1000,
-  writer_counts => [1000, 10000, 100000, 500000, 1000000],
-  ecall_batch_sizes => [10, 100, 1000, 10000],
+  writer_counts => [1000, 10000, 100000, 500000, 1000000]
+}}.
+
+{env_settings, #{
+  ecall_batch_size => 1000,
   distribution_busy_limit_kib => 1024
 }}.
 ```
 
-The workload lists are ordered. Suites run writer counts and `ecall` batch sizes
-in their configured order. A user can replace either list, change the pace or
-message quota, or select individual suites and groups through Common Test.
-The harness logs the resolved values and never silently scales them down.
+The payload list is hardcoded by `performance_payloads`. The writer-count list
+is ordered, and each suite runs writer counts in that configured order. A user
+can replace the writer list, change the pace, message quota, `ecall` batch
+size, or busy limit through Common Test config. The harness does not validate
+config values: bad input is allowed to crash the test.
 
 The full default matrix is intentionally very large. Development and smoke
-runs should select a subset of groups or use a smaller CT configuration.
+runs should use a smaller CT configuration.
 
 A remote role is configured directly in CT config:
 
@@ -117,13 +123,6 @@ A remote role is configured directly in CT config:
   }
 }}.
 ```
-
-The suite validates its configuration before starting containers. Pace,
-message count, every writer count, every batch size, and busy limit must be
-positive integers. Writer-count and batch-size lists must not be empty. For
-OTP 27, the busy limit must be in `1..2097151` KiB. Values within each list
-must be distinct. The largest writer count must fit the fixed participant
-process capacity after role services are started.
 
 ## Docker and peer requirements
 
@@ -142,17 +141,9 @@ Remote Docker commands are executed over SSH using the role config.
 +zdbbl <distribution_busy_limit_kib>
 ```
 
-`+zdbbl` is a startup option measured in KiB. After each peer starts, the
-orchestrator must assert that:
-
-```erlang
-erlang:system_info(dist_buf_busy_limit)
-    =:= DistributionBusyLimitKiB * 1024
-```
-
-Changing the busy limit requires a new peer start. A busy-limit experiment is
-therefore a new CT invocation or suite run with another config value, not an
-in-suite sweep on existing nodes.
+`+zdbbl` is a startup option measured in KiB. Changing the busy limit requires
+a new peer start. A busy-limit experiment is therefore a new CT invocation or
+suite run with another config value, not an in-suite sweep on existing nodes.
 
 System capacity is an orchestration prerequisite, not a workload parameter.
 Both participant nodes start with fixed limits that leave capacity for the
@@ -168,14 +159,9 @@ These are test-harness constants and are not exposed through CT config.
 `+P` uses the OTP 27 maximum so the sender can hold all writer processes and
 the receiver can absorb concurrent cast and call target processes. `+Q` and
 `+e` provide ample port and ETS capacity for the role runtime and counters.
-After role services start, the sender must still have more free process slots
-than the largest configured writer count.
 
-Role containers run without Docker PID or memory caps, and their open-file
-limit must be at least `1048576`. Before running a workload, orchestration
-verifies the effective BEAM process, port, and ETS limits and the container
-limits. If the environment cannot supply them, suite initialization fails
-before measurement.
+Role containers are started without Docker PID or memory caps and with an
+open-file limit of `1048576`.
 
 A `system_limit`, process-table exhaustion, port-table exhaustion, ETS-table
 exhaustion, Docker OOM kill, or equivalent limit-driven failure is an invalid
@@ -183,37 +169,37 @@ test environment, not a benchmark result. The test suite must be provisioned so
 these failures do not occur.
 
 `distributed_tests_utils` owns image preparation, local or remote Docker
-startup, peer startup, node connectivity, and cleanup.
+startup, peer startup, Erlang distribution readiness, `ecall` startup,
+connection readiness, and cleanup.
 
 ## Suite initialization and readiness
 
-`init_per_suite/1` must complete these gates in order:
-
-1. Begin a new suite-local topology generation and read and validate CT
-   configuration.
-2. Start the sender and receiver Docker-backed peers with the configured VM
-   startup values.
-3. Verify that the controller can reach both nodes and that sender and receiver
-   have bidirectional Erlang distribution connectivity.
-4. Run `application:ensure_all_started(ecall)` successfully on both role nodes.
-5. Establish `ecall` connections from sender to receiver and from receiver to
-   sender.
-6. Verify that both connections have live `ecall` proxy pools and perform a
-   tagged probe through each actual proxy path.
-
-The suite must not proceed after merely observing that the Erlang nodes are
-connected. It must prove that `ecall` is running and connected in both
-directions. A successful call through `ecall` alone is not sufficient proof,
-because the current API can fall back to a native operation when no proxy is
-registered.
-
-To make connection state and batch selection explicit, the implementation must
-extend `ecall_connection` with this API contract:
+`init_per_suite/1` reads workload config and calls:
 
 ```erlang
--spec connect(node(), #{batch_size := pos_integer()}) ->
-  ok | {error, term()}.
+[SenderNode, ReceiverNode] =
+    distributed_tests_utils:start_nodes(NodeConfigs)
+```
 
+`start_nodes/1` completes these gates before returning:
+
+1. Read `env_settings`.
+2. Start the sender and receiver Docker-backed peers with the configured VM
+   startup values.
+3. Ensure that the controller can reach both nodes and that sender and receiver
+   have bidirectional Erlang distribution connectivity.
+4. Set the `ecall` batch size and run `application:ensure_all_started(ecall)`
+   on both role nodes.
+5. Establish `ecall` connections from sender to receiver and from receiver to
+   sender.
+6. Read `connection_info/1` for each direction.
+
+The suite does not call distribution or `ecall` readiness helpers directly.
+Bad CT config is allowed to crash whichever step first needs it.
+
+Connection state is read through this API:
+
+```erlang
 -spec connection_info(node()) ->
   {ok, #{
     status := connected,
@@ -224,33 +210,16 @@ extend `ecall_connection` with this API contract:
   | {error, not_connected}.
 ```
 
-Connection changes are serialized per remote node. `connect/1` ensures that a
-connection exists but never replaces a live explicitly configured connection.
-`connect/2` is idempotent when the requested batch is already active and
-atomically replaces a live connection with a different batch. `disconnect/1`
-is idempotent and returns only after the routing entry and supervised connection
-are gone. These rules prevent the automatic PG-driven `connect/1` from racing a
-test's explicit batch selection.
-
-`connect/1` and `connect/2` return only after the proxy pool is registered and
-usable. The `connection_pid` reported by `connection_info/1` owns the
-authoritative routing entry and its complete proxy pool. While that PID is
-alive, operations for the remote node must use that pool and must not fall back
-to native distribution. Loss or replacement of any pool member invalidates the
-connection PID.
-
-`connection_info/1` is the supported readiness and diagnostic interface; test
+`connection_info/1` is the supported readiness and diagnostic interface. Test
 utilities must not inspect `ecall_connection` records or `persistent_term`
-layout. The harness monitors `connection_pid`, verifies the expected batch
-size and a nonzero proxy count, runs the tagged probe, and checks that the same
-connection stayed alive for the point.
+layout.
 
 Readiness is predicate-based. Fixed sleeps are not readiness checks. If an
 asynchronous startup step needs waiting, it completes when the expected state
 or tagged handshake is observed.
 
 The resulting suite `Config` contains the sender node, receiver node, and
-validated performance settings required by the testcases.
+performance settings required by the testcases.
 
 ## Common workload contract
 
@@ -354,41 +323,15 @@ workload operation.
 
 ### Failure handling
 
-Writer processes, role coordinators, targets or counters, peer nodes, and the
-active `ecall` connection workers are monitored. An abnormal `DOWN`, `nodedown`,
-unexpected result, `ecall` fallback, proxy restart, or lost connection fails
-the active point immediately. The failure and resolved point parameters are
-logged with `ct:pal/2` before `ct:fail/1`.
-
-The cast target catches an operation exception, sends one tagged failure
-message with class, reason, and stack to the receiver coordinator, and then
-exits. Call failures are observed through their replies, and send-receiver
-failure is observed through its monitor. Limit-driven cast spawn failures are
-prevented by the system-capacity requirements above.
-
-Any point failure invalidates the suite topology. The failure path records that
-state and its generation in `distributed_tests_utils`, stops point-local
-processes and both peers, and then fails the testcase. Each later
-`init_per_testcase/2` in that suite observes the invalid generation and returns
-a skip reason; it never reconstructs the topology. This is required because
-`ct:fail/1` alone would allow Common Test to start the next testcase.
-
-`end_per_testcase/2` checks Common Test's testcase status and performs the same
-invalidation for every non-success result. Unexpected exceptions and harness
-failures therefore cannot bypass topology shutdown merely because they did not
-use the normal point-failure helper.
+Writer processes and point-local targets or counters are monitored. An
+abnormal `DOWN`, unexpected result, wrong count, or lost target fails the active
+point immediately. The test code is intentionally crash-forward: unexpected
+config or environment problems are allowed to fail at the point where they are
+used.
 
 Every workload testcase sets its Common Test timetrap to `infinity`, so Common
 Test's implicit timetrap cannot terminate a healthy large point. A point ends
 only at its exact completion barrier or upon an observed failure.
-
-If a participant node dies, the same invalidation path applies. Later points
-are not attempted on a partially reconstructed topology.
-
-Invalidation is suite-local. After the failed suite's idempotent cleanup, the
-next operation suite may create a new topology generation in its own
-`init_per_suite/1`. Starting that generation clears only the completed prior
-suite's invalid marker; it never resumes skipped points from the failed suite.
 
 ## Compared operation paths
 
@@ -416,79 +359,33 @@ result.
 
 ## Common Test case hierarchy
 
-The three operation suites use the same matrix. Their native group names are:
-
-| Suite | Native group | Native operation | `ecall` group operation |
-|---|---|---|---|
-| `performance_send_SUITE` | `raw` | `!` | `ecall:send/2` |
-| `performance_cast_SUITE` | `erpc` | `erpc:cast/4` | `ecall:cast/4` |
-| `performance_call_SUITE` | `erpc` | `erpc:call/4` | `ecall:call/4` |
-
-With the default writer list, each native group contains this payload and
-writer hierarchy:
+Each operation suite exports exactly two test cases:
 
 ```text
-raw or erpc
-  tiny
-    writers_1k
-    writers_10k
-    writers_100k
-    writers_500k
-    writers_1m
-  data
-    writers_1k
-    writers_10k
-    writers_100k
-    writers_500k
-    writers_1m
-  binary_100kib
-    writers_1k
-    writers_10k
-    writers_100k
-    writers_500k
-    writers_1m
-  binary_1mib
-    writers_1k
-    writers_10k
-    writers_100k
-    writers_500k
-    writers_1m
+native_test
+ecall_test
 ```
 
-Each `ecall` group contains every configured batch size. With the default
-config, the hierarchy is:
+Both cases run the same payload and writer-count matrix in code:
 
 ```text
-ecall
-  batch_10
-    tiny
-      writers_1k ... writers_1m
-    data
-      writers_1k ... writers_1m
-    binary_100kib
-      writers_1k ... writers_1m
-    binary_1mib
-      writers_1k ... writers_1m
-  batch_100
-    tiny/data/binary_100kib/binary_1mib
-      writers_1k ... writers_1m
-  batch_1000
-    tiny/data/binary_100kib/binary_1mib
-      writers_1k ... writers_1m
-  batch_10000
-    tiny/data/binary_100kib/binary_1mib
-      writers_1k ... writers_1m
+tiny
+  writers_1k
+  writers_10k
+  writers_100k
+  writers_500k
+  writers_1m
+data
+  writers_1k ... writers_1m
+binary_100kib
+  writers_1k ... writers_1m
+binary_1mib
+  writers_1k ... writers_1m
 ```
 
-The suites derive writer and batch points from the ordered CT lists. Every
-combination is separately logged and selectable. All points belong to a
-top-level group with the Common Test `sequence` property. No performance group
-may use `parallel`. The explicit invalid-topology check above also prevents
-continuation if nested-group failure propagation is insufficient.
-
-This matrix is the complete workload scope for this phase. It has no unpaced
-fixed-work case, receiver-work case, hard-coded busy-limit sweep, or
-batch-size-1 proxy control.
+`native_test` calls `native_test_point(Payload, Writers)` for each point.
+`ecall_test` calls `ecall_test_point(Payload, Writers)` for each point. There
+is no Common Test group hierarchy and no `ecall` batch-size cycle.
 
 ## `ecall` batch-size requirement
 
@@ -496,25 +393,19 @@ The selected batch size is the maximum number of logical operations collected
 into one `ecall` proxy batch. A partial batch remains valid when the proxy has
 no immediately available request.
 
-The current production implementation has a compile-time batch size of 1000.
-To execute the required matrix honestly, `ecall` must make the maximum batch
-size the explicit `connect/2` connection-start setting defined above. Every
-configured batch group, including `1000`, uses `connect/2`. Existing callers of
-`connect/1` retain the production default of 1000.
+The batch size is configured once per suite through `env_settings`:
 
-Before each `ecall` batch group, the harness must:
+```erlang
+{env_settings, #{
+  ecall_batch_size => 1000
+}}.
+```
 
-1. finish the previous point, if any, exactly, with no requests in flight;
-2. stop the existing `ecall` connections in both directions;
-3. create fresh connection workers with `connect/2` and the configured batch
-   size on both participant nodes;
-4. read the effective connection state through `connection_info/1`;
-5. monitor both connection PIDs and run the bidirectional proxy probes;
-6. verify and log the effective batch size.
-
-A custom forwarding proxy or synthetic batching helper is not an acceptable
-substitute. The measured operations must call `ecall:send/2`, `ecall:cast/4`,
-or `ecall:call/4` as appropriate.
+`distributed_tests_utils:start_nodes/1` applies it on every participant node
+before the `ecall` connections are established. A custom forwarding proxy or
+synthetic batching helper is not an acceptable substitute. The measured
+operations must call `ecall:send/2`, `ecall:cast/4`, or `ecall:call/4` as
+appropriate.
 
 ## Result logging
 
@@ -523,12 +414,10 @@ structured `ct:pal/2` entry containing:
 
 - suite and operation;
 - native or `ecall` path;
-- configured and effective batch size when applicable;
 - payload profile;
 - writer count;
 - pace and messages per writer;
 - expected and completed operations;
-- configured and effective distribution busy limit;
 - elapsed monotonic time;
 - completed operations per second.
 
@@ -542,9 +431,7 @@ After a successful point, all writers must have exited normally, the target and
 counter must be stopped, and no operation for its `RunRef` may remain in flight.
 The next point starts with fresh point-local processes and state.
 
-After a point failure, point-local cleanup and topology invalidation run before
-the testcase ends. After an initialization or node failure, any partially
-started topology is invalidated immediately.
+After a point failure, point-local cleanup runs before the testcase ends.
 
 `end_per_suite/1` idempotently stops any remaining peers and removes their
 local or remote Docker containers. It is safe after an earlier failure path has
@@ -558,27 +445,21 @@ The suite lifecycle is complete when a smoke configuration proves that:
   and are loadable on every node;
 - local sender and receiver Docker peers start through `peer`;
 - CT config can place a role on a remote Docker host;
-- the configured `+zdbbl` value is effective;
-- the required BEAM and container system capacities are effective;
 - `ecall` is started on both nodes;
-- Erlang distribution and actual `ecall` proxy paths work in both directions;
-- monitored role procedures can be run on both peers;
+- Erlang distribution and `ecall` connections are ready before
+  `start_nodes/1` returns;
 - cleanup removes both role containers after success or failure.
 
 The workload layer is complete when:
 
-- CT config can replace pace, message quota, writer-count list, batch-size
-  list, and distribution busy limit without suite code changes;
-- the three suites expose the native and `ecall` hierarchy specified above;
-- every native point and every batch/payload/writer `ecall` point uses the real
-  operation API and the same target behavior;
+- CT config can replace pace, message quota, writer-count list, `ecall` batch
+  size, and distribution busy limit without suite code changes;
+- the three suites expose only `native_test` and `ecall_test`;
+- every native point and every payload/writer `ecall` point uses the real
+  operation API;
 - every successful send and cast point confirms the exact remote execution
   count;
 - every successful call point validates the exact reply count;
 - participant or connection failure fails the point instead of producing a
   partial result;
-- no point fails because a BEAM, container, or operating-system capacity limit
-  was configured too low;
-- any point failure skips all remaining points in the current operation suite
-  without rebuilding that suite's topology;
 - results appear only in Common Test logs.
