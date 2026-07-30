@@ -18,7 +18,8 @@
 
 -spec profiles() -> [profile()].
 profiles() ->
-  [tiny, data, binary_100kib, binary_1mib].
+  %[tiny, data, binary_100kib, binary_1mib].
+  [tiny, data].
 
 -spec new(profile()) -> term().
 new(tiny) ->

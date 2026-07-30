@@ -18,6 +18,9 @@
 -define(PROCESS_LIMIT, 134217727).
 -define(PORT_LIMIT, 1048576).
 -define(ETS_LIMIT, 262144).
+-define(LOCAL_NODE_HOST, "127.0.0.1").
+-define(DIST_PORT_BASE, 4443).
+-define(SSH_PORT, "22").
 
 
 %%====================================================================
@@ -26,7 +29,7 @@
 
 -spec start_nodes([map()]) -> [node()].
 start_nodes(NodeConfigs) ->
-  EnvSettings = env_settings(),
+  EnvSettings = ct:get_config(env_settings),
   Cookie = ensure_controller_cookie(NodeConfigs),
   Nodes = [start_node(NodeConfig, Cookie, EnvSettings)
            || NodeConfig <- NodeConfigs],
@@ -47,20 +50,23 @@ stop_nodes(Nodes) ->
 %%====================================================================
 
 start_node(#{location := local} = Config, Cookie, EnvSettings) ->
-  Docker = docker_executable(),
   ProjectDir = project_dir(),
-  ensure_local_image(Docker, ProjectDir),
+  ensure_local_image(ProjectDir),
   Name = maps:get(name, Config),
   Container = unique_name(atom_to_list(Name)),
-  Node = node_name(Name, local_node_host()),
-  Exec = {Docker, docker_run_args(Container)},
+  Node = node_name(Name, ?LOCAL_NODE_HOST),
+  Exec = {os:find_executable("docker"), docker_run_args(Container)},
   start_peer(Node, Exec, Container, local, Config, Cookie, EnvSettings);
-start_node(#{location := Location0} = Config, Cookie, EnvSettings) ->
-  Location = remote_location(Location0),
-  prepare_remote_host(Location),
+start_node(
+    #{location := #{host := Host,
+                    user := _User,
+                    password := _Password} = Location} = Config,
+    Cookie,
+    EnvSettings) ->
+  remote_build_image(Location),
   Name = maps:get(name, Config),
   Container = unique_name(atom_to_list(Name)),
-  Node = node_name(Name, maps:get(node_host, Location)),
+  Node = node_name(Name, Host),
   Exec = remote_docker_run_exec(Location, Container),
   start_peer(Node, Exec, Container, {remote, Location}, Config, Cookie, EnvSettings).
 
@@ -120,21 +126,13 @@ docker_run_args(Container) ->
 remote_docker_run_exec(Location, Container) ->
   remote_exec(Location, ["docker" | docker_run_args(Container)]).
 
-remote_location(Location) ->
-  Location#{
-    port => maps:get(port, Location, "22"),
-    node_host => maps:get(node_host, Location, maps:get(host, Location))
-  }.
-
 node_name(Name, Host) ->
   list_to_atom(atom_to_list(Name) ++ "@" ++ Host).
 
 node_dist_port(sender) ->
-  dist_port_base() + 1;
+  ?DIST_PORT_BASE + 1;
 node_dist_port(receiver) ->
-  dist_port_base() + 2;
-node_dist_port(Name) ->
-  dist_port_base() + 10 + erlang:phash2(Name, 1000).
+  ?DIST_PORT_BASE + 2.
 
 
 %%====================================================================
@@ -295,7 +293,7 @@ stop_peer(Peer) ->
   ok.
 
 remove_node_container(#{location := local, container := Container}) ->
-  _ = run(docker_executable(), ["rm", "-f", Container], ?COMMAND_TIMEOUT),
+  _ = run("docker", ["rm", "-f", Container], ?COMMAND_TIMEOUT),
   ok;
 remove_node_container(#{location := remote,
                         host_config := Location,
@@ -324,12 +322,12 @@ put_started_node(Node, NodeState) ->
 %% DOCKER AND REMOTE COMMANDS
 %%====================================================================
 
-ensure_local_image(Docker, ProjectDir) ->
+ensure_local_image(ProjectDir) ->
   Dockerfile = filename:join([ProjectDir, "test", "performance", "Dockerfile"]),
   ct:pal("Rebuilding performance image ~s from current source", [?IMAGE]),
   command_ok(
     "docker build",
-    Docker,
+    "docker",
     [
       "build",
       "--file", Dockerfile,
@@ -337,15 +335,7 @@ ensure_local_image(Docker, ProjectDir) ->
       "--tag", ?IMAGE,
       ProjectDir
     ],
-    ?BUILD_TIMEOUT,
-    []).
-
-prepare_remote_host(Location) ->
-  _ = remote_ok(
-        Location,
-        ["docker", "version", "--format", "{{.Server.Version}}"],
-        ?COMMAND_TIMEOUT),
-  remote_build_image(Location).
+    ?BUILD_TIMEOUT).
 
 remote_build_image(Location) ->
   ProjectDir = project_dir(),
@@ -366,51 +356,37 @@ remote_build_image(Location) ->
     "tar -C " ++ shell_quote(ProjectDir) ++ " -cf - . | "
     "tar -C \"$tmp\" -xf - && "
     "tar -C \"$tmp\" -cf - . | " ++ RemoteBuild,
-  command_ok("remote docker build", "sh", ["-c", Command], ?REMOTE_TIMEOUT, []),
+  command_ok("remote docker build", "sh", ["-c", Command], ?REMOTE_TIMEOUT),
   ok.
 
-remote_ok(Location, RemoteArgs, Timeout) ->
-  {Exec, Args, Env} = remote_exec_parts(Location, RemoteArgs),
-  command_ok("remote command", Exec, Args, Timeout, Env).
-
 remote_run(Location, RemoteArgs, Timeout) ->
-  {Exec, Args, Env} = remote_exec_parts(Location, RemoteArgs),
-  run(Exec, Args, Timeout, Env).
+  {Exec, Args} = remote_exec_parts(Location, RemoteArgs),
+  run(Exec, Args, Timeout).
 
 remote_exec(Location, RemoteArgs) ->
-  {Exec, Args, _Env} = remote_exec_parts(Location, RemoteArgs),
-  {Exec, Args}.
+  {Exec, Args} = remote_exec_parts(Location, RemoteArgs),
+  {os:find_executable(Exec), Args}.
 
 remote_exec_parts(Location, RemoteArgs) ->
   SshArgs = ssh_args(Location) ++ RemoteArgs,
-  case maps:get(password, Location, undefined) of
-    undefined ->
-      {ssh_executable(), SshArgs, []};
-    _Password ->
-      {sshpass_executable(), ["-f", password_file(Location), ssh_executable()
-                              | SshArgs], []}
-  end.
+  {
+    "sshpass",
+    ["-f", password_file(Location), os:find_executable("ssh") | SshArgs]
+  }.
 
 remote_command_string(Location, RemoteArgs) ->
-  {Exec, Args, _Env} = remote_exec_parts(Location, RemoteArgs),
+  {Exec, Args} = remote_exec_parts(Location, RemoteArgs),
   string:join([shell_quote(Exec) | [shell_quote(Arg) || Arg <- Args]], " ").
 
 ssh_args(Location) ->
   User = maps:get(user, Location),
   Host = maps:get(host, Location),
-  Port = maps:get(port, Location),
-  AuthArgs =
-    case maps:get(password, Location, undefined) of
-      undefined ->
-        ["-o", "BatchMode=yes"];
-      _Password ->
-        []
-    end,
   [
-    "-p", Port,
+    "-p", ?SSH_PORT,
     "-o", "StrictHostKeyChecking=accept-new",
-    "-o", "ConnectTimeout=10"
-  ] ++ AuthArgs ++ [User ++ "@" ++ Host].
+    "-o", "ConnectTimeout=10",
+    User ++ "@" ++ Host
+  ].
 
 
 %%====================================================================
@@ -434,9 +410,8 @@ ensure_controller_node(Cookie, NodeConfigs) ->
   end.
 
 set_controller_dist_port() ->
-  Port = dist_port_base(),
-  ok = application:set_env(kernel, inet_dist_listen_min, Port),
-  ok = application:set_env(kernel, inet_dist_listen_max, Port).
+  ok = application:set_env(kernel, inet_dist_listen_min, ?DIST_PORT_BASE),
+  ok = application:set_env(kernel, inet_dist_listen_max, ?DIST_PORT_BASE).
 
 set_cookie(Cookie) ->
   true = erlang:set_cookie(node(), list_to_atom(Cookie)),
@@ -449,14 +424,14 @@ controller_node_name(NodeConfigs) ->
 controller_node_host(NodeConfigs) ->
   case remote_locations(NodeConfigs) of
     [] ->
-      local_node_host();
+      ?LOCAL_NODE_HOST;
     [Location | _Rest] ->
       detect_controller_host(Location)
   end.
 
 remote_locations(NodeConfigs) ->
   [
-    remote_location(Location)
+    Location
     || #{location := Location} <- NodeConfigs,
        Location =/= local
   ].
@@ -471,16 +446,14 @@ detect_controller_host(Location) ->
 %% COMMAND HELPERS
 %%====================================================================
 
-password_file(Location) ->
-  Key = {maps:get(host, Location),
-         maps:get(port, Location),
-         maps:get(user, Location)},
+password_file(#{host := Host, user := User, password := Password}) ->
+  Key = {Host, User},
   State = state(),
   PasswordFiles = maps:get(password_files, State, #{}),
   case maps:get(Key, PasswordFiles, undefined) of
     undefined ->
       Path = filename:join("/tmp", unique_name("sshpass")),
-      ok = file:write_file(Path, maps:get(password, Location)),
+      ok = file:write_file(Path, Password),
       ok = file:change_mode(Path, 8#600),
       put_state(State#{password_files => PasswordFiles#{Key => Path}}),
       Path;
@@ -495,25 +468,8 @@ remove_password_files() ->
   put_state(State#{password_files => #{}}),
   ok.
 
-docker_executable() ->
-  executable("docker").
-
-ssh_executable() ->
-  executable("ssh").
-
-sshpass_executable() ->
-  executable("sshpass").
-
-executable(Name) ->
-  case os:find_executable(Name) of
-    false ->
-      ct:fail({executable_not_found, Name});
-    Path ->
-      Path
-  end.
-
-command_ok(Label, Exec, Args, Timeout, Env) ->
-  case run(Exec, Args, Timeout, Env) of
+command_ok(Label, Exec, Args, Timeout) ->
+  case run(Exec, Args, Timeout) of
     {0, Output} ->
       Output;
     {Status, Output} when is_integer(Status) ->
@@ -522,24 +478,12 @@ command_ok(Label, Exec, Args, Timeout, Env) ->
       ct:fail({command_failed, Label, Reason})
   end.
 
-run(Exec0, Args, Timeout) ->
-  run(Exec0, Args, Timeout, []).
-
-run(Exec0, Args, Timeout, Env) ->
-  Exec = resolve_executable(Exec0),
+run(Exec, Args, Timeout) ->
   Port =
     open_port(
-      {spawn_executable, Exec},
-      [{args, Args}, {env, Env}, binary, exit_status, stderr_to_stdout]),
+      {spawn_executable, os:find_executable(Exec)},
+      [{args, Args}, binary, exit_status, stderr_to_stdout]),
   collect_port(Port, Timeout, []).
-
-resolve_executable(Exec) ->
-  case filename:pathtype(Exec) of
-    absolute ->
-      Exec;
-    _Relative ->
-      os:find_executable(Exec)
-  end.
 
 collect_port(Port, Timeout, Acc) ->
   receive
@@ -563,52 +507,15 @@ trim_output(Output) ->
 
 
 %%====================================================================
-%% ENVIRONMENT AND NAMES
+%% PATHS AND NAMES
 %%====================================================================
 
-env_settings() ->
-  maps:merge(default_env_settings(), ct:get_config(env_settings, #{})).
-
-default_env_settings() ->
-  #{
-    ecall_batch_size => 1000,
-    distribution_busy_limit_kib => 1024
-  }.
-
 project_dir() ->
-  case os:getenv("PERFORMANCE_APP_DIR") of
-    false ->
-      project_dir_from_code_path();
-    ProjectDir ->
-      ProjectDir
-  end.
-
-project_dir_from_code_path() ->
-  {ok, Cwd} = file:get_cwd(),
-  case filelib:is_file(filename:join([Cwd, "test", "performance", "Dockerfile"])) of
-    true ->
-      Cwd;
-    false ->
-      {ok, AppDir} = file:get_cwd(),
-      AppDir
-  end.
-
-local_node_host() ->
-  env("PERFORMANCE_LOCAL_NODE_HOST", "127.0.0.1").
-
-env(Name, Default) ->
-  case os:getenv(Name) of
-    false ->
-      Default;
-    Value ->
-      Value
-  end.
-
-integer_env(Name, Default) ->
-  list_to_integer(env(Name, integer_to_list(Default))).
-
-dist_port_base() ->
-  integer_env("PERFORMANCE_DIST_PORT_BASE", 4443).
+  AppDir = code:lib_dir(ecall),
+  filename:dirname(
+    filename:dirname(
+      filename:dirname(
+        filename:dirname(AppDir)))).
 
 unique_name(Prefix) ->
   "ecall-performance-" ++ Prefix ++ "-" ++ os:getpid() ++ "-" ++ unique_suffix().

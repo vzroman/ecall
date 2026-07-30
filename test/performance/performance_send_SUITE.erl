@@ -17,19 +17,26 @@
 
 -define(TAG, ?MODULE).
 -define(RPC_TIMEOUT, 30000).
+-define(PAYLOAD_KEY, {?MODULE, payload}).
 
 -record(point, {
   run_ref,
   path,
   receiver_node,
-  target,
   payload_profile,
-  payload,
   writer_count,
   messages_per_writer,
   pace_ms,
   expected,
   metadata = #{}
+}).
+
+-record(writer, {
+  run_ref,
+  path,
+  target,
+  messages_per_writer,
+  pace_ms
 }).
 
 -record(state, {
@@ -145,19 +152,26 @@ point_metadata(ecall) ->
 
 run_send_point(Config) ->
   Point = send_point(Config),
-  State0 = start_participants(Point),
+  persistent_term:put(
+    ?PAYLOAD_KEY,
+    performance_payloads:new(Point#point.payload_profile)),
   try
-    State1 = await_ready(State0),
-    StartedAt = erlang:monotonic_time(millisecond),
-    release_writers(State1),
-    State2 = await_completion(State1),
-    ElapsedMs = erlang:monotonic_time(millisecond) - StartedAt,
-    ok = stop_targets(State2),
-    result_map(Point, State2, ElapsedMs)
-  catch
-    Class:Reason:Stack ->
-      cleanup_point(State0),
-      erlang:raise(Class, Reason, Stack)
+    State0 = start_participants(Point),
+    try
+      State1 = await_ready(State0),
+      StartedAt = erlang:monotonic_time(millisecond),
+      release_writers(State1),
+      State2 = await_completion(State1),
+      ElapsedMs = erlang:monotonic_time(millisecond) - StartedAt,
+      ok = stop_targets(State2),
+      result_map(Point, State2, ElapsedMs)
+    catch
+      Class:Reason:Stack ->
+        cleanup_point(State0),
+        erlang:raise(Class, Reason, Stack)
+    end
+  after
+    persistent_term:erase(?PAYLOAD_KEY)
   end.
 
 send_point(Config) ->
@@ -168,7 +182,6 @@ send_point(Config) ->
     path = maps:get(path, Config),
     receiver_node = maps:get(receiver_node, Config),
     payload_profile = maps:get(payload_profile, Config),
-    payload = performance_payloads:new(maps:get(payload_profile, Config)),
     writer_count = WriterCount,
     messages_per_writer = MessagesPerWriter,
     pace_ms = maps:get(pace_ms, Config),
@@ -220,9 +233,15 @@ start_writers(Targets, Point) ->
 start_writers([], _Point, _Coordinator, Acc) ->
   Acc;
 start_writers([Target | Targets], Point, Coordinator, Acc) ->
-  WriterPoint = Point#point{target = Target},
+  Writer = #writer{
+    run_ref = Point#point.run_ref,
+    path = Point#point.path,
+    target = Target,
+    messages_per_writer = Point#point.messages_per_writer,
+    pace_ms = Point#point.pace_ms
+  },
   {Pid, _Mon} =
-    spawn_monitor(fun() -> writer_loop(WriterPoint, Coordinator) end),
+    spawn_monitor(fun() -> writer_loop(Writer, Coordinator) end),
   start_writers(Targets, Point, Coordinator, [Pid | Acc]).
 
 await_ready(#state{
@@ -308,38 +327,43 @@ handle_writer_down(Pid, Reason, _State) ->
 %% Writers and target
 %%====================================================================
 
-writer_loop(Point, Coordinator) ->
-  RunRef = Point#point.run_ref,
+writer_loop(Writer, Coordinator) ->
+  RunRef = Writer#writer.run_ref,
   Coordinator ! {?TAG, RunRef, writer_ready, self()},
   receive
     {?TAG, RunRef, start} ->
-      Completed = writer_operations(1, 0, Point),
+      Completed = writer_operations(1, 0, Writer),
       Coordinator ! {?TAG, RunRef, writer_completed, self(), Completed};
     Message ->
       exit({unexpected_writer_message, Message})
   end.
 
-writer_operations(Seq, Completed, #point{messages_per_writer = Max})
+writer_operations(Seq, Completed, #writer{messages_per_writer = Max})
     when Seq > Max ->
   Completed;
-writer_operations(Seq, Completed, Point)
-    when Seq =:= Point#point.messages_per_writer ->
-  ok = send_operation(Point),
-  writer_operations(Seq + 1, Completed + 1, Point);
-writer_operations(Seq, Completed, #point{pace_ms = PaceMs, run_ref = RunRef} = Point) ->
+writer_operations(Seq, Completed, Writer)
+    when Seq =:= Writer#writer.messages_per_writer ->
+  ok = send_operation(Writer),
+  writer_operations(Seq + 1, Completed + 1, Writer);
+writer_operations(
+    Seq,
+    Completed,
+    #writer{pace_ms = PaceMs, run_ref = RunRef} = Writer) ->
   TimerRef = erlang:start_timer(PaceMs, self(), {?TAG, RunRef, pace, Seq}),
-  ok = send_operation(Point),
+  ok = send_operation(Writer),
   receive
     {timeout, TimerRef, {?TAG, RunRef, pace, Seq}} ->
-      writer_operations(Seq + 1, Completed + 1, Point);
+      writer_operations(Seq + 1, Completed + 1, Writer);
     Message ->
       exit({unexpected_pace_message, Message})
   end.
 
-send_operation(#point{path = native, target = Target, payload = Payload}) ->
+send_operation(#writer{path = native, target = Target}) ->
+  Payload = persistent_term:get(?PAYLOAD_KEY),
   Target ! Payload,
   ok;
-send_operation(#point{path = ecall, target = Target, payload = Payload}) ->
+send_operation(#writer{path = ecall, target = Target}) ->
+  Payload = persistent_term:get(?PAYLOAD_KEY),
   _ = ecall:send(Target, Payload),
   ok.
 
