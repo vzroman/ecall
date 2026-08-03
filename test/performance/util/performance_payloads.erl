@@ -18,8 +18,7 @@
 
 -spec profiles() -> [profile()].
 profiles() ->
-  %[tiny, data, binary_100kib, binary_1mib].
-  [tiny, data].
+  [tiny, data, binary_10kib, binary_100kib, binary_1mib].
 
 -spec new(profile()) -> term().
 new(tiny) ->
@@ -30,6 +29,9 @@ new(data) ->
     archive2 => data_archive(),
     archive3 => data_archive()
   };
+
+new(binary_10kib) ->
+  binary:copy(<<0>>, 10240);
 new(binary_100kib) ->
   binary:copy(<<0>>, 102400);
 new(binary_1mib) ->
