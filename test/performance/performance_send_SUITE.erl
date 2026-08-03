@@ -51,7 +51,8 @@
   ready = 0,
   writer_completed = 0,
   writer_down = 0,
-  completed = 0
+  completed = 0,
+  metrics
 }).
 
 
@@ -60,8 +61,8 @@
 %%====================================================================
 
 all() ->
-  %[native_test, ecall_test].
-  [ecall_test].
+  [native_test, ecall_test].
+  %[ecall_test].
 
 init_per_suite(Config) ->
   Performance = performance_settings(),
@@ -161,12 +162,19 @@ run_send_point(Config) ->
     State0 = start_participants(Point),
     try
       State1 = await_ready(State0),
-      StartedAt = erlang:monotonic_time(millisecond),
-      release_writers(State1),
-      State2 = await_completion(State1),
-      ElapsedMs = erlang:monotonic_time(millisecond) - StartedAt,
-      ok = stop_targets(State2),
-      result_map(Point, State2, ElapsedMs)
+      Metrics = performance_metrics:start(),
+      try
+        ok = performance_metrics:begin_point(Metrics),
+        StartedAt = erlang:monotonic_time(millisecond),
+        release_writers(State1),
+        State2 = await_completion(State1#state{metrics = Metrics}),
+        ElapsedMs = erlang:monotonic_time(millisecond) - StartedAt,
+        MetricResults = performance_metrics:finish(Metrics),
+        ok = stop_targets(State2),
+        result_map(Point, State2, ElapsedMs, MetricResults)
+      after
+        performance_metrics:abort(Metrics)
+      end
     catch
       Class:Reason:Stack ->
         cleanup_point(State0),
@@ -306,8 +314,13 @@ handle_completion_message({?TAG, RunRef, writer_completed, _Pid, Count}, State)
     writer_completed = State#state.writer_completed + 1,
     completed = State#state.completed + Count
   };
-handle_completion_message({'DOWN', Mon, process, Pid, Reason}, State) ->
-  handle_down(Mon, Pid, Reason, State);
+handle_completion_message(
+    {'DOWN', Mon, process, Pid, Reason} = Message,
+    State) ->
+  case performance_metrics:handle_down(Message, State#state.metrics) of
+    not_collector ->
+      handle_down(Mon, Pid, Reason, State)
+  end;
 handle_completion_message(Message, _State) ->
   exit({unexpected_completion_message, Message}).
 
@@ -429,7 +442,7 @@ cleanup_point(#state{target_pids = Targets, target_monitors = TargetMonitors,
     TargetMonitors),
   ok.
 
-result_map(Point, State, ElapsedMs) ->
+result_map(Point, State, ElapsedMs, Metrics) ->
   Base = #{
     suite => ?MODULE,
     operation => send,
@@ -439,16 +452,16 @@ result_map(Point, State, ElapsedMs) ->
     writer_count => Point#point.writer_count,
     messages_per_writer => Point#point.messages_per_writer,
     pace_ms => Point#point.pace_ms,
-    expected => Point#point.expected,
-    completed => State#state.completed,
     elapsed_ms => ElapsedMs,
-    completed_per_second => completed_per_second(State#state.completed, ElapsedMs)
+    operations_per_second =>
+      operations_per_second(State#state.completed, ElapsedMs),
+    metrics => Metrics
   },
   maps:merge(Base, Point#point.metadata).
 
-completed_per_second(_Completed, 0) ->
+operations_per_second(_Completed, 0) ->
   0.0;
-completed_per_second(Completed, ElapsedMs) ->
+operations_per_second(Completed, ElapsedMs) ->
   (Completed * 1000) / ElapsedMs.
 
 

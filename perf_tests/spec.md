@@ -408,24 +408,19 @@ appropriate.
 
 ## Point metrics
 
-Every successful point collects memory, distribution, and lock metrics from
-both the sender and receiver nodes. Metrics from the two roles remain separate
-in the result so that sender-side queueing is not combined with receiver-side
-work.
+Every successful point collects memory and lock metrics from the sender node.
 
 ### Collector lifecycle
 
 After the writers and targets have reached the start barrier, the sender
-coordinator starts one metrics collector on each participant node and waits
-until both collectors are ready. Each collector reads metrics locally; it does
-not poll the other participant over the distribution connection under test.
+coordinator starts one local metrics collector and waits until it is ready.
 
 The measured point follows this sequence:
 
-1. Start both metrics collectors.
-2. Clear lock counters on both participant nodes.
+1. Start the sender metrics collector.
+2. Clear lock counters on the sender node.
 3. Record the point start time and release the writers.
-4. Collect memory and distribution metrics every 100 milliseconds.
+4. Collect memory metrics every 100 milliseconds.
 5. Stop collection when the point completion condition is met.
 6. Collect the lock-counter results and build the point result.
 
@@ -438,53 +433,23 @@ separate setup, ready, completion, or cleanup memory snapshots.
 Each 100-millisecond sample reads:
 
 ```erlang
-erlang:memory([total, processes, processes_used])
+erlang:memory(total)
 ```
 
-For each value, the point result contains its average and maximum in bytes.
-The tests do not read Linux `/proc` memory information.
-
-### Distribution metrics
-
-Each collector finds the distribution controller for the other participant
-through `erlang:system_info(dist_ctrl)`. For the ordinary TCP distribution
-port, it samples:
-
-```erlang
-inet:getstat(Port, [
-  send_oct,
-  recv_oct,
-  send_cnt,
-  recv_cnt,
-  send_pend
-])
-```
-
-It also samples the ERTS driver queue through:
-
-```erlang
-erlang:port_info(Port, queue_size)
-```
-
-The result contains point deltas for `send_oct`, `recv_oct`, `send_cnt`, and
-`recv_cnt`. It contains average and maximum values for `send_pend` and the port
-queue size. Socket pending bytes and the ERTS driver queue are distinct values;
-neither is presented as the internal `DistEntry.qsize`.
-
-The tests do not enable or collect `busy_dist_port` system-monitor events.
+The point result contains the average and maximum total memory in bytes. The
+tests do not read Linux `/proc` memory information.
 
 ### Lock metrics
 
-Participant nodes run an OTP lock-counting emulator. Immediately before the
-writers are released, the harness calls `lcnt:clear/1` for both nodes. After
-point completion, it calls `lcnt:collect/1` and includes the normal combined
-lock statistics in the result.
+The sender node runs an OTP lock-counting emulator. Immediately before the
+writers are released, the collector calls `lcnt:clear/0`. After point
+completion, it calls `lcnt:rt_collect/0`.
 
-Lock collection is not restricted to the distribution category and is not
-sampled every 100 milliseconds. Statistics are combined by lock class instead
-of reporting every individual process lock. Each lock entry contains the
-standard lock name, acquisition attempts, collisions, collision percentage,
-accumulated wait time, and duration percentage.
+The lock-counter mask is restricted to the distribution category, which is the
+narrowest category supported by OTP for this lock. The result retains only
+`dist_entry_out_queue` and combines all of its instances. No other locks are
+reported. The result contains accumulated wait time, collision percentage, and
+duration percentage. Lock counters are not sampled every 100 milliseconds.
 
 ## Result logging
 
@@ -498,7 +463,7 @@ structured `ct:pal/2` entry containing:
 - pace and messages per writer;
 - elapsed monotonic time;
 - operations per second;
-- sender and receiver memory, distribution, and lock metrics.
+- sender memory and lock metrics.
 
 Expected and completed operation counts remain internal completion invariants.
 They are not included in the successful point log entry.
@@ -544,6 +509,5 @@ The workload layer is complete when:
 - every successful call point validates the exact reply count;
 - participant or connection failure fails the point instead of producing a
   partial result;
-- every successful point contains separate sender and receiver memory,
-  distribution, and combined lock metrics;
+- every successful point contains sender memory and combined lock metrics;
 - results appear only in Common Test logs.

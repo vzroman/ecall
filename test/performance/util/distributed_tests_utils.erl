@@ -95,6 +95,7 @@ erl_args(Cookie, DistPort, EnvSettings) ->
   ["-pa" | container_code_paths()] ++
     [
       "-setcookie", Cookie,
+      "-emu_type", "lcnt",
       "+zdbbl", BusyKiB,
       "+P", integer_to_list(?PROCESS_LIMIT),
       "+Q", integer_to_list(?PORT_LIMIT),
