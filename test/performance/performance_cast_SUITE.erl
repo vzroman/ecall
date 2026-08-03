@@ -97,9 +97,10 @@ ecall_test(Config) ->
 %%====================================================================
 
 run_payloads(Path, Config) ->
+  Performance = ?config(performance, Config),
   [
     run_writer_counts(Path, PayloadProfile, Config)
-    || PayloadProfile <- payload_profiles()
+    || PayloadProfile <- maps:get(payloads, Performance)
   ],
   ok.
 
@@ -435,7 +436,8 @@ default_performance_settings() ->
   #{
     pace_ms => 100,
     messages_per_writer => 1000,
-    writer_counts => [1000, 10000, 100000, 500000, 1000000]
+    writer_counts => [1000, 10000, 100000, 500000, 1000000],
+    payloads => [tiny, data, binary_10kib, binary_100kib, binary_1mib]
   }.
 
 role_config() ->
@@ -469,11 +471,3 @@ run_on_sender(SenderNode, Fun) ->
     {'DOWN', Mon, process, Pid, Reason} ->
       exit({sender_point_failed, Reason})
   end.
-
-
-%%====================================================================
-%% Payloads
-%%====================================================================
-
-payload_profiles() ->
-  performance_payloads:profiles().
