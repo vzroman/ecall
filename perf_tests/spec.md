@@ -462,8 +462,13 @@ structured `ct:pal/2` entry containing:
 - writer count;
 - pace and messages per writer;
 - elapsed monotonic time;
-- operations per second;
+- performance percentage relative to the configured per-writer pace;
 - sender memory and lock metrics.
+
+The expected operations per second for one writer is `1000 / pace_ms`.
+`performance_percent` is the measured per-writer operations per second divided
+by that expected rate and multiplied by 100. A value of `100.0` means the
+configured pace was sustained.
 
 Expected and completed operation counts remain internal completion invariants.
 They are not included in the successful point log entry.

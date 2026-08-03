@@ -427,16 +427,26 @@ result_map(Point, State, ElapsedMs, Metrics) ->
     messages_per_writer => Point#point.messages_per_writer,
     pace_ms => Point#point.pace_ms,
     elapsed_ms => ElapsedMs,
-    operations_per_second =>
-      operations_per_second(State#state.completed, ElapsedMs),
+    performance_percent =>
+      performance_percent(
+        State#state.completed,
+        Point#point.writer_count,
+        Point#point.pace_ms,
+        ElapsedMs),
     metrics => Metrics
   },
   maps:merge(Base, Point#point.metadata).
 
-operations_per_second(_Completed, 0) ->
+performance_percent(_Completed, _WriterCount, _PaceMs, 0) ->
   0.0;
-operations_per_second(Completed, ElapsedMs) ->
-  (Completed * 1000) / ElapsedMs.
+performance_percent(Completed, WriterCount, PaceMs, ElapsedMs) ->
+  OperationsPerSecond =
+    operations_per_second(Completed, WriterCount, ElapsedMs),
+  ExpectedOperationsPerSecond = 1000 / PaceMs,
+  (OperationsPerSecond * 100) / ExpectedOperationsPerSecond.
+
+operations_per_second(Completed, WriterCount, ElapsedMs) ->
+  (Completed * 1000) / (WriterCount * ElapsedMs).
 
 
 %%====================================================================
