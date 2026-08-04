@@ -21,8 +21,10 @@ project findings explain why the comparison is valuable: native sends to one
 remote node share one distribution path, while `ecall` limits direct
 distribution writers and combines logical operations into batches.
 
-Receiver-work variants, automated comparison reports, CSV files, and
-presentation tooling are outside this implementation phase.
+Receiver-work variants and CSV files are outside this implementation phase.
+Completed points are also stored as JSON and presented by a separate web
+application that compares native and `ecall` results from every retained
+Common Test run.
 
 ## Implementation layout
 
@@ -33,6 +35,7 @@ under that directory; reusable modules are under `test/performance/util/`.
 test/performance/
   util/
     distributed_tests_utils.erl
+    performance_metrics.erl
     performance_payloads.erl
   performance_send_SUITE.erl
   performance_cast_SUITE.erl
@@ -40,6 +43,11 @@ test/performance/
   performance.config
   test.spec
   Dockerfile
+
+performance_report/
+  package.json
+  server/
+  src/
 ```
 
 `distributed_tests_utils` is only responsible for starting and stopping
@@ -50,7 +58,8 @@ Common Test code paths must make the suite and utility BEAM files available to
 the controller, sender, and receiver nodes.
 
 `perf_tests/spec.md` and `perf_tests/findings.md` are design documents, not
-Common Test inputs. A reporting module is not part of this phase.
+Common Test inputs. The reporting web application is independent of Common
+Test execution and reads the result files left under `_build/test/logs`.
 
 The normal entry point remains:
 
@@ -60,6 +69,9 @@ make performance_tests
 
 It compiles the project and invokes Common Test with
 `test/performance/test.spec`.
+
+The reporting application uses its own normal Node.js package and build
+commands. It does not add a reporting target to the project Makefile.
 
 ## Topology
 
@@ -451,16 +463,35 @@ narrowest category supported by OTP for this lock. The result retains only
 reported. The result contains accumulated wait time, collision percentage, and
 duration percentage. Lock counters are not sampled every 100 milliseconds.
 
-## Result logging
+## Result storage and reporting
 
-There is no reporting layer in this phase. A successful point emits one
-structured `ct:pal/2` entry containing:
+### Completed-point output
+
+After a point completes successfully, its suite calls:
+
+```erlang
+performance_metrics:point(Config, Result)
+```
+
+`point/2` reads `distribution_busy_limit_kib` from `env_settings`, adds it to
+the result, logs the result through `ct:pal/2`, and writes the same result as
+JSON. It owns the operation-specific Common Test messages, including:
+
+```erlang
+ct:pal("Send performance point completed: ~p", [Result])
+```
+
+with equivalent messages for cast and call points. The suites do not log the
+successful result separately.
+
+The logged and stored result contains:
 
 - suite and operation;
 - native or `ecall` path;
 - payload profile;
 - writer count;
 - pace and messages per writer;
+- distribution busy limit in KiB;
 - elapsed monotonic time;
 - performance percentage relative to the configured per-writer pace;
 - sender memory and lock metrics.
@@ -473,9 +504,78 @@ configured pace was sustained.
 Expected and completed operation counts remain internal completion invariants.
 They are not included in the successful point log entry.
 
-Failed points log the same identifying parameters plus the failure reason.
-The implementation does not create auxiliary result files, comparison
-artifacts, or a reporting module.
+`point/2` writes one JSON file per completed point under the Common Test
+suite's `priv_dir`:
+
+```text
+log_private/
+  performance_data/
+    send.native.tiny.10000.json
+    send.ecall.tiny.10000.json
+```
+
+The JSON object has `schema_version` set to `1` and otherwise preserves the
+result-map structure. OTP's `json:encode/1` performs the encoding. The file is
+written directly to its final name; there is no temporary-file protocol. A
+reader can observe an incomplete file while the write is in progress.
+
+A JSON write error fails at the file operation. Failed performance points do
+not produce JSON. Their diagnosis remains in the standard Common Test report,
+and their missing results are shown as unavailable by the reporting
+application.
+
+### Reporting web application
+
+The reporting layer is a conventional small Node.js web application under
+`performance_report/`. It has a normal package-manager and frontend build
+workflow. The application consists of:
+
+- a Node.js HTTP backend that scans and parses stored point files;
+- an API that returns all discovered runs, valid points, and parse errors;
+- a built frontend with run selection, metric grids, and charts.
+
+The backend resolves `_build/test/logs` relative to the project and scans all
+matching files below:
+
+```text
+ct_run.*/**/log_private/performance_data/*.json
+```
+
+Each outer `ct_run.*` directory is one report run. Points from the send, cast,
+and call suite directories below it belong to that run. The backend parses the
+files on every report-data request. An invalid JSON file is included in the
+reported error list and skipped; it is tried again on the next request. This
+also handles files observed while Common Test is still writing them.
+
+The backend serves both the built frontend and the existing `_build/test/logs`
+tree read-only. A run view links to its standard Common Test report. The web
+application can run while Common Test is producing additional point files,
+and the frontend periodically refreshes the report data.
+
+### Grids and trends
+
+Every run is organized by operation and payload. `writer_count` is the
+horizontal variable for both grids and charts.
+
+Grid columns are the writer counts sorted numerically in ascending order. Grid
+rows identify the path and metric, for example native performance percentage,
+`ecall` performance percentage, native average memory, and `ecall` average
+memory.
+
+Charts use a numeric `writer_count` X axis. Native and `ecall` are separate
+series. The reported trends cover:
+
+- performance percentage;
+- average memory;
+- maximum memory;
+- lock wait;
+- lock collision percentage;
+- lock duration percentage.
+
+A series is identified by the run, operation, payload, path, messages per
+writer, pace, distribution busy limit, and metric. Each series value is a
+`{writer_count, metric_value}` point. Missing writer counts and missing native
+or `ecall` counterparts are gaps or `N/A`; they are never converted to zero.
 
 ## Isolation and cleanup
 
@@ -515,4 +615,9 @@ The workload layer is complete when:
 - participant or connection failure fails the point instead of producing a
   partial result;
 - every successful point contains sender memory and combined lock metrics;
-- results appear only in Common Test logs.
+- every successful point is logged by `performance_metrics:point/2` and saved
+  as one JSON file containing `distribution_busy_limit_kib`;
+- the reporting backend discovers valid point files across all retained Common
+  Test runs and reports invalid files without discarding other results;
+- each run view compares native and `ecall` metrics in grids and charts using
+  `writer_count` as the horizontal variable.
