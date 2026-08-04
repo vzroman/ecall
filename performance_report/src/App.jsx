@@ -25,8 +25,8 @@ const REFRESH_INTERVAL_MS = 5000;
 const paths = ['native', 'ecall'];
 const metrics = [
   {id: 'performance_percent', label: 'Performance', unit: '%', value: point => point.performance_percent},
-  {id: 'average_memory', label: 'Average memory', unit: 'bytes', value: point => point.metrics?.memory?.average_bytes},
-  {id: 'maximum_memory', label: 'Maximum memory', unit: 'bytes', value: point => point.metrics?.memory?.maximum_bytes},
+  {id: 'average_memory', label: 'Average memory', unit: 'GB', value: point => point.metrics?.memory?.average_bytes / 1_000_000_000},
+  {id: 'maximum_memory', label: 'Maximum memory', unit: 'GB', value: point => point.metrics?.memory?.maximum_bytes / 1_000_000_000},
   {id: 'lock_wait', label: 'Lock wait', unit: 'µs', value: point => point.metrics?.locks?.wait_us},
   {id: 'lock_collision', label: 'Lock collisions', unit: '%', value: point => point.metrics?.locks?.collision_percent},
   {id: 'lock_duration', label: 'Lock duration', unit: '%', value: point => point.metrics?.locks?.duration_percent}
@@ -38,8 +38,44 @@ function configKey(point) {
     point.payload,
     point.messages_per_writer,
     point.pace_ms,
-    point.distribution_busy_limit_kib
+    point.distribution_busy_limit_kib,
+    point.sender_config,
+    point.receiver_config
   ].join('|');
+}
+
+function runAnchor(run) {
+  return `run-${run.id}`;
+}
+
+function runConfig(run) {
+  const point = run.points[0];
+  return {
+    sender: point?.sender_config ?? 'Unavailable',
+    receiver: point?.receiver_config ?? 'Unavailable',
+    busyLimit: point === undefined
+      ? 'Unavailable'
+      : `${point.distribution_busy_limit_kib} KiB`
+  };
+}
+
+function runDateTime(run) {
+  const match = run.id.match(/\d{4}-\d{2}-\d{2}_\d{2}\.\d{2}\.\d{2}$/);
+  return match?.[0] ?? run.id;
+}
+
+function RunRow({run}) {
+  const config = runConfig(run);
+  return (
+    <tr>
+      <th scope="row">
+        <a href={`#${runAnchor(run)}`}>{runDateTime(run)}</a>
+      </th>
+      <td>{config.sender}</td>
+      <td>{config.receiver}</td>
+      <td>{config.busyLimit}</td>
+    </tr>
+  );
 }
 
 function groupPoints(points) {
@@ -53,6 +89,8 @@ function groupPoints(points) {
         messagesPerWriter: point.messages_per_writer,
         paceMs: point.pace_ms,
         busyLimitKiB: point.distribution_busy_limit_kib,
+        senderConfig: point.sender_config ?? 'Unavailable',
+        receiverConfig: point.receiver_config ?? 'Unavailable',
         points: []
       });
     }
@@ -72,10 +110,12 @@ function valueAt(points, path, writerCount, metric) {
 
 function formatValue(value, unit) {
   if (value === null) return 'N/A';
-  if (unit === 'bytes') {
-    return new Intl.NumberFormat().format(Math.round(value));
-  }
-  return `${new Intl.NumberFormat(undefined, {maximumFractionDigits: 2}).format(value)} ${unit}`;
+  const maximumFractionDigits = unit === 'GB' ? 3 : 2;
+  const formatted = new Intl.NumberFormat(
+    undefined,
+    {maximumFractionDigits}
+  ).format(value);
+  return `${formatted} ${unit}`;
 }
 
 function MetricGrid({group, writerCounts}) {
@@ -84,14 +124,25 @@ function MetricGrid({group, writerCounts}) {
       <table>
         <thead>
           <tr>
-            <th>Path / metric</th>
+            <th>Metric</th>
+            <th>Path</th>
             {writerCounts.map(count => <th key={count}>{count.toLocaleString()}</th>)}
           </tr>
         </thead>
         <tbody>
-          {paths.flatMap(path => metrics.map(metric => (
-            <tr key={`${path}.${metric.id}`}>
-              <th><span className={`path-marker ${path}`} />{path} · {metric.label}</th>
+          {metrics.flatMap(metric => paths.map((path, pathIndex) => (
+            <tr
+              className={pathIndex === paths.length - 1 ? 'metric-row-end' : undefined}
+              key={`${metric.id}.${path}`}
+            >
+              {pathIndex === 0 && (
+                <th className="metric-name" rowSpan={paths.length}>
+                  {metric.label}
+                </th>
+              )}
+              <th className="path-name">
+                <span className={`path-marker ${path}`} />{path}
+              </th>
               {writerCounts.map(count => (
                 <td key={count}>{formatValue(valueAt(group.points, path, count, metric), metric.unit)}</td>
               ))}
@@ -121,7 +172,15 @@ function MetricChart({group, metric, writerCounts}) {
     animation: false,
     maintainAspectRatio: false,
     parsing: false,
-    plugins: {legend: {position: 'bottom'}},
+    plugins: {
+      legend: {position: 'bottom'},
+      tooltip: {
+        callbacks: {
+          label: context =>
+            `${context.dataset.label}: ${formatValue(context.parsed.y, metric.unit)}`
+        }
+      }
+    },
     scales: {
       x: {type: 'linear', title: {display: true, text: 'Writer count'}},
       y: {title: {display: true, text: metric.unit}, beginAtZero: false}
@@ -135,7 +194,7 @@ function MetricChart({group, metric, writerCounts}) {
   );
 }
 
-function PointGroup({group}) {
+function PointGroup({group, dateTime}) {
   const writerCounts = [...new Set(group.points.map(point => point.writer_count))]
     .sort((left, right) => left - right);
   return (
@@ -143,12 +202,15 @@ function PointGroup({group}) {
       <header>
         <div>
           <span className="eyebrow">{group.operation}</span>
-          <h2>{group.payload} payload</h2>
+          <h3>{group.payload} payload</h3>
         </div>
         <dl className="config">
+          <div><dt>Date/time</dt><dd>{dateTime}</dd></div>
           <div><dt>Messages / writer</dt><dd>{group.messagesPerWriter}</dd></div>
           <div><dt>Pace</dt><dd>{group.paceMs} ms</dd></div>
           <div><dt>Busy limit</dt><dd>{group.busyLimitKiB} KiB</dd></div>
+          <div><dt>Sender</dt><dd>{group.senderConfig}</dd></div>
+          <div><dt>Receiver</dt><dd>{group.receiverConfig}</dd></div>
         </dl>
       </header>
       <MetricGrid group={group} writerCounts={writerCounts} />
@@ -166,6 +228,43 @@ function PointGroup({group}) {
   );
 }
 
+function RunErrors({errors}) {
+  if (errors.length === 0) return null;
+  return (
+    <details className="alert" open>
+      <summary>{errors.length} point file(s) could not be parsed</summary>
+      <ul>
+        {errors.map(error => (
+          <li key={error.file}><code>{error.file}</code>: {error.message}</li>
+        ))}
+      </ul>
+    </details>
+  );
+}
+
+function RunSection({run, anchor}) {
+  const groups = useMemo(() => groupPoints(run.points), [run.points]);
+  const dateTime = runDateTime(run);
+  return (
+    <section className="run-section" id={anchor}>
+      <header className="run-header">
+        <h2>Performance run</h2>
+        <a href={run.report_url}>Open Common Test report ↗</a>
+      </header>
+      <RunErrors errors={run.errors} />
+      {groups.length === 0
+        ? <div className="empty"><h3>No completed points in this run</h3></div>
+        : groups.map(group => (
+          <PointGroup
+            key={configKey(group.points[0])}
+            group={group}
+            dateTime={dateTime}
+          />
+        ))}
+    </section>
+  );
+}
+
 function EmptyState() {
   return (
     <div className="empty">
@@ -177,7 +276,6 @@ function EmptyState() {
 
 export default function App() {
   const [report, setReport] = useState({runs: []});
-  const [selectedRunId, setSelectedRunId] = useState(null);
   const [loadError, setLoadError] = useState(null);
   const [updatedAt, setUpdatedAt] = useState(null);
 
@@ -187,10 +285,6 @@ export default function App() {
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const nextReport = await response.json();
       setReport(nextReport);
-      setSelectedRunId(current =>
-        nextReport.runs.some(run => run.id === current)
-          ? current
-          : nextReport.runs[0]?.id ?? null);
       setLoadError(null);
       setUpdatedAt(new Date());
     } catch (error) {
@@ -204,11 +298,6 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, []);
 
-  const selectedRun = report.runs.find(run => run.id === selectedRunId);
-  const groups = useMemo(
-    () => groupPoints(selectedRun?.points ?? []),
-    [selectedRun]);
-
   return (
     <main>
       <header className="page-header">
@@ -218,44 +307,48 @@ export default function App() {
           <p>Native Erlang distribution and ecall, compared at each writer count.</p>
         </div>
         <div className="toolbar">
-          <label>
-            Run
-            <select
-              value={selectedRunId ?? ''}
-              onChange={event => setSelectedRunId(event.target.value)}
-              disabled={report.runs.length === 0}
-            >
-              {report.runs.map(run => (
-                <option key={run.id} value={run.id}>{run.id}</option>
-              ))}
-            </select>
-          </label>
           <button type="button" onClick={refresh}>Refresh</button>
         </div>
       </header>
 
       <div className="status">
         <span>{updatedAt ? `Updated ${updatedAt.toLocaleTimeString()}` : 'Loading…'}</span>
-        {selectedRun && <a href={selectedRun.report_url}>Open Common Test report ↗</a>}
+        <span>{report.runs.length} run(s)</span>
       </div>
 
       {loadError && <div className="alert">Could not load report data: {loadError}</div>}
-      {selectedRun?.errors.length > 0 && (
-        <details className="alert" open>
-          <summary>{selectedRun.errors.length} point file(s) could not be parsed</summary>
-          <ul>
-            {selectedRun.errors.map(error => (
-              <li key={error.file}><code>{error.file}</code>: {error.message}</li>
-            ))}
-          </ul>
-        </details>
-      )}
 
       {report.runs.length === 0
         ? <EmptyState />
-        : groups.length === 0
-          ? <div className="empty"><h2>No completed points in this run</h2></div>
-          : groups.map(group => <PointGroup key={configKey(group.points[0])} group={group} />)}
+        : <>
+          <nav className="contents" aria-label="Performance runs">
+            <h2>Runs</h2>
+            <div className="table-scroll">
+              <table className="runs-grid">
+                <thead>
+                  <tr>
+                    <th>Date/time</th>
+                    <th>Sender</th>
+                    <th>Receiver</th>
+                    <th>Busy limit</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {report.runs.map(run => (
+                    <RunRow key={run.id} run={run} />
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </nav>
+          {report.runs.map(run => (
+            <RunSection
+              key={run.id}
+              run={run}
+              anchor={runAnchor(run)}
+            />
+          ))}
+        </>}
     </main>
   );
 }

@@ -473,9 +473,12 @@ After a point completes successfully, its suite calls:
 performance_metrics:point(Config, Result)
 ```
 
-`point/2` reads `distribution_busy_limit_kib` from `env_settings`, adds it to
-the result, logs the result through `ct:pal/2`, and writes the same result as
-JSON. It owns the operation-specific Common Test messages, including:
+`point/2` reads `distribution_busy_limit_kib` from `env_settings` and the
+sender and receiver locations from `role_config`, adds them to the result,
+logs the result through `ct:pal/2`, and writes the same result as JSON. A local
+role is stored as `local`. A remote role is stored as `user@host`; its password
+and the rest of the role map are never logged or stored. It owns the
+operation-specific Common Test messages, including:
 
 ```erlang
 ct:pal("Send performance point completed: ~p", [Result])
@@ -492,6 +495,7 @@ The logged and stored result contains:
 - writer count;
 - pace and messages per writer;
 - distribution busy limit in KiB;
+- sanitized sender and receiver configuration;
 - elapsed monotonic time;
 - performance percentage relative to the configured per-writer pace;
 - sender memory and lock metrics.
@@ -515,9 +519,12 @@ log_private/
 ```
 
 The JSON object has `schema_version` set to `1` and otherwise preserves the
-result-map structure. OTP's `json:encode/1` performs the encoding. The file is
-written directly to its final name; there is no temporary-file protocol. A
-reader can observe an incomplete file while the write is in progress.
+result-map structure. Sender and receiver configurations are JSON strings.
+OTP's `json:encode/1` performs the encoding. The file is written directly to
+its final name; there is no temporary-file protocol. A reader can observe an
+incomplete file while the write is in progress. For compatibility, the parser
+also accepts existing schema-version-1 files without role configuration and
+the frontend presents their roles as `Unavailable`.
 
 A JSON write error fails at the file operation. Failed performance points do
 not produce JSON. Their diagnosis remains in the standard Common Test report,
@@ -532,7 +539,7 @@ workflow. The application consists of:
 
 - a Node.js HTTP backend that scans and parses stored point files;
 - an API that returns all discovered runs, valid points, and parse errors;
-- a built frontend with run selection, metric grids, and charts.
+- a built frontend with run navigation, metric grids, and charts.
 
 The backend resolves `_build/test/logs` relative to the project and scans all
 matching files below:
@@ -548,13 +555,16 @@ reported error list and skipped; it is tried again on the next request. This
 also handles files observed while Common Test is still writing them.
 
 The backend serves both the built frontend and the existing `_build/test/logs`
-tree read-only. A run view links to its standard Common Test report. The web
-application can run while Common Test is producing additional point files,
-and the frontend periodically refreshes the report data.
+tree read-only. Each run section links to its standard Common Test report. The
+web application can run while Common Test is producing additional point
+files, and the frontend periodically refreshes the report data.
 
 ### Grids and trends
 
-Every run is organized by operation and payload. `writer_count` is the
+The page presents every parsed run; it does not hide runs behind a selector.
+A contents section at the top links to each run section. Every run is organized
+by operation and payload, and each group header shows messages per writer,
+pace, distribution busy limit, sender, and receiver. `writer_count` is the
 horizontal variable for both grids and charts.
 
 Grid columns are the writer counts sorted numerically in ascending order. Grid
@@ -572,10 +582,14 @@ series. The reported trends cover:
 - lock collision percentage;
 - lock duration percentage.
 
+Average and maximum memory are stored as bytes but converted to decimal
+gigabytes (bytes divided by `1,000,000,000`) in both grids and charts.
+
 A series is identified by the run, operation, payload, path, messages per
-writer, pace, distribution busy limit, and metric. Each series value is a
-`{writer_count, metric_value}` point. Missing writer counts and missing native
-or `ecall` counterparts are gaps or `N/A`; they are never converted to zero.
+writer, pace, distribution busy limit, sender, receiver, and metric. Each
+series value is a `{writer_count, metric_value}` point. Missing writer counts
+and missing native or `ecall` counterparts are gaps or `N/A`; they are never
+converted to zero.
 
 ## Isolation and cleanup
 
@@ -616,8 +630,10 @@ The workload layer is complete when:
   partial result;
 - every successful point contains sender memory and combined lock metrics;
 - every successful point is logged by `performance_metrics:point/2` and saved
-  as one JSON file containing `distribution_busy_limit_kib`;
+  as one JSON file containing `distribution_busy_limit_kib` and sanitized
+  sender and receiver configuration, without a password;
 - the reporting backend discovers valid point files across all retained Common
   Test runs and reports invalid files without discarding other results;
-- each run view compares native and `ecall` metrics in grids and charts using
-  `writer_count` as the horizontal variable.
+- one report page links to every parsed run and compares native and `ecall`
+  metrics in grids and charts using `writer_count` as the horizontal variable;
+- both memory metrics are presented in decimal gigabytes.

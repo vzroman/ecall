@@ -15,6 +15,8 @@ function validPoint(overrides = {}) {
     messages_per_writer: 100,
     pace_ms: 10,
     distribution_busy_limit_kib: 1024,
+    sender_config: 'local',
+    receiver_config: 'runner@receiver.example.net',
     elapsed_ms: 1000,
     performance_percent: 100,
     metrics: {
@@ -92,11 +94,17 @@ test('skips JSON that does not match the point schema', async () => {
           }
         }
       })));
+    await writeFile(
+      path.join(dataDirectory, 'invalid-sender-config.json'),
+      JSON.stringify(validPoint({sender_config: ''})));
+    await writeFile(
+      path.join(dataDirectory, 'invalid-receiver-config.json'),
+      JSON.stringify(validPoint({receiver_config: {host: 'receiver'}})));
 
     const result = await scanRuns(temporaryRoot);
 
     assert.equal(result.runs[0].points.length, 0);
-    assert.equal(result.runs[0].errors.length, 3);
+    assert.equal(result.runs[0].errors.length, 5);
     assert.ok(result.runs[0].errors.every(
       error => error.message.startsWith('invalid performance point field:')));
     assert.ok(result.runs[0].errors.some(
@@ -105,6 +113,39 @@ test('skips JSON that does not match the point schema', async () => {
       error => error.message.endsWith('path')));
     assert.ok(result.runs[0].errors.some(
       error => error.message.endsWith('metrics.locks.wait_us')));
+    assert.ok(result.runs[0].errors.some(
+      error => error.message.endsWith('sender_config')));
+    assert.ok(result.runs[0].errors.some(
+      error => error.message.endsWith('receiver_config')));
+  } finally {
+    await rm(temporaryRoot, {recursive: true, force: true});
+  }
+});
+
+test('accepts legacy points without role configuration', async () => {
+  const temporaryRoot = await mkdtemp(
+    path.join(os.tmpdir(), 'ecall-performance-report-legacy-'));
+  try {
+    const dataDirectory = path.join(
+      temporaryRoot,
+      'ct_run.legacy',
+      'performance_send_SUITE.logs',
+      'log_private',
+      'performance_data');
+    await mkdir(dataDirectory, {recursive: true});
+    const point = validPoint();
+    delete point.sender_config;
+    delete point.receiver_config;
+    await writeFile(
+      path.join(dataDirectory, 'legacy.json'),
+      JSON.stringify(point));
+
+    const result = await scanRuns(temporaryRoot);
+
+    assert.equal(result.runs[0].points.length, 1);
+    assert.equal(result.runs[0].errors.length, 0);
+    assert.equal(result.runs[0].points[0].sender_config, undefined);
+    assert.equal(result.runs[0].points[0].receiver_config, undefined);
   } finally {
     await rm(temporaryRoot, {recursive: true, force: true});
   }

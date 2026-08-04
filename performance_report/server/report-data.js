@@ -18,6 +18,14 @@ function isPositiveInteger(value) {
   return Number.isInteger(value) && value > 0;
 }
 
+function validateOptionalString(point, field) {
+  const value = point[field];
+  requireValue(
+    value === undefined ||
+      (typeof value === 'string' && value.length > 0),
+    field);
+}
+
 function validatePoint(point) {
   requireValue(
     point !== null && typeof point === 'object' && !Array.isArray(point),
@@ -36,6 +44,8 @@ function validatePoint(point) {
   requireValue(
     isPositiveInteger(point.distribution_busy_limit_kib),
     'distribution_busy_limit_kib');
+  validateOptionalString(point, 'sender_config');
+  validateOptionalString(point, 'receiver_config');
   requireValue(
     isFiniteNumber(point.elapsed_ms) && point.elapsed_ms >= 0,
     'elapsed_ms');

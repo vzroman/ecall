@@ -75,13 +75,23 @@ abort(#collector{pid = Pid, monitor = Monitor}) ->
 -spec point(list(), map()) -> ok.
 point(Config, Result) ->
   EnvSettings = ct:get_config(env_settings),
+  RoleConfig = ct:get_config(role_config),
   StoredResult = Result#{
     schema_version => 1,
     distribution_busy_limit_kib =>
-      maps:get(distribution_busy_limit_kib, EnvSettings)
+      maps:get(distribution_busy_limit_kib, EnvSettings),
+    sender_config => role_description(maps:get(sender, RoleConfig)),
+    receiver_config => role_description(maps:get(receiver, RoleConfig))
   },
   log_point(StoredResult),
   write_point(Config, StoredResult).
+
+role_description(local) ->
+  <<"local">>;
+role_description(Role) ->
+  User = maps:get(user, Role),
+  Host = maps:get(host, Role),
+  iolist_to_binary([User, $@, Host]).
 
 log_point(#{operation := send} = Result) ->
   ct:pal("Send performance point completed: ~p", [Result]);
