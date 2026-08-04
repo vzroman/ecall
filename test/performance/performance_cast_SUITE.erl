@@ -139,8 +139,7 @@ run_cast_test_point(Path, PayloadProfile, WriterCount, Config) ->
     run_on_sender(
       ?config(sender_node, Config),
       fun() -> run_cast_point(PointConfig) end),
-  ct:pal("Cast performance point completed: ~p", [Result]),
-  ok.
+  ok = performance_metrics:point(Config, Result).
 
 point_metadata(native) ->
   #{};

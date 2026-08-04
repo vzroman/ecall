@@ -140,8 +140,7 @@ run_send_test_point(Path, PayloadProfile, WriterCount, Config) ->
     run_on_sender(
       ?config(sender_node, Config),
       fun() -> run_send_point(PointConfig) end),
-  ct:pal("Send performance point completed: ~p", [Result]),
-  ok.
+  ok = performance_metrics:point(Config, Result).
 
 point_metadata(native) ->
   #{};

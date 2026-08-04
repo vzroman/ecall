@@ -6,7 +6,8 @@
   begin_point/1,
   finish/1,
   handle_down/2,
-  abort/1
+  abort/1,
+  point/2
 ]).
 
 -define(TAG, ?MODULE).
@@ -70,6 +71,41 @@ abort(#collector{pid = Pid, monitor = Monitor}) ->
   erlang:demonitor(Monitor, [flush]),
   exit(Pid, kill),
   ok.
+
+-spec point(list(), map()) -> ok.
+point(Config, Result) ->
+  EnvSettings = ct:get_config(env_settings),
+  StoredResult = Result#{
+    schema_version => 1,
+    distribution_busy_limit_kib =>
+      maps:get(distribution_busy_limit_kib, EnvSettings)
+  },
+  log_point(StoredResult),
+  write_point(Config, StoredResult).
+
+log_point(#{operation := send} = Result) ->
+  ct:pal("Send performance point completed: ~p", [Result]);
+log_point(#{operation := cast} = Result) ->
+  ct:pal("Cast performance point completed: ~p", [Result]);
+log_point(#{operation := call} = Result) ->
+  ct:pal("Call performance point completed: ~p", [Result]).
+
+write_point(Config, Result) ->
+  PrivDir = proplists:get_value(priv_dir, Config),
+  DataDir = filename:join(PrivDir, "performance_data"),
+  File = filename:join(DataDir, point_filename(Result)),
+  ok = filelib:ensure_dir(File),
+  ok = file:write_file(File, json:encode(Result)).
+
+point_filename(#{
+    operation := Operation,
+    path := Path,
+    payload := Payload,
+    writer_count := WriterCount}) ->
+  lists:flatten(
+    io_lib:format(
+      "~s.~s.~s.~B.json",
+      [Operation, Path, Payload, WriterCount])).
 
 
 %%====================================================================
