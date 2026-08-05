@@ -362,15 +362,10 @@ writer_operations(Seq, Completed, Writer)
 writer_operations(
     Seq,
     Completed,
-    #writer{pace_ms = PaceMs, run_ref = RunRef} = Writer) ->
-  TimerRef = erlang:start_timer(PaceMs, self(), {?TAG, RunRef, pace, Seq}),
+    #writer{pace_ms = PaceMs} = Writer) ->
   ok = send_operation(Writer),
-  receive
-    {timeout, TimerRef, {?TAG, RunRef, pace, Seq}} ->
-      writer_operations(Seq + 1, Completed + 1, Writer);
-    Message ->
-      exit({unexpected_pace_message, Message})
-  end.
+  ok = timer:sleep(PaceMs),
+  writer_operations(Seq + 1, Completed + 1, Writer).
 
 send_operation(#writer{path = native, target = Target}) ->
   Payload = persistent_term:get(?PAYLOAD_KEY),
