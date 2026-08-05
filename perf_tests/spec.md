@@ -146,6 +146,18 @@ The fixed role image is `ecall-performance:otp27` and uses OTP 27. Its build
 context contains the compiled application, performance suites, and utility
 modules. The application is available at `/opt/ecall` in the container.
 
+The role image is built on `ecall-performance-env:otp27`. The environment image
+contains OTP and the `beam.lcnt` emulator and is built once with:
+
+```text
+make performance_env
+```
+
+The environment image is deployed to an offline controller before running the
+suite. Rebuilding the role image then only copies the current checkout over the
+environment image; it does not run commands, access a registry, or download OTP
+sources.
+
 Role containers use host networking so Erlang distribution is reachable
 between the controller and both Docker hosts. The controller and peers use
 long node names, one shared cookie, and non-conflicting distribution ports.
@@ -171,6 +183,9 @@ The offline bundle contains both Docker images. Install and run it with
 `/home/romanvozfp/ecall_tests`. The runner mounts `performance.config` and
 `test.spec` from that artifact directory so both inputs remain editable without
 rebuilding the image.
+
+The controller image selects prebuilt mode through
+`ECALL_PERFORMANCE_PREBUILT_IMAGE=true`.
 
 `+zdbbl` is a startup option measured in KiB. Changing the busy limit requires
 a new peer start. A busy-limit experiment is therefore a new CT invocation or

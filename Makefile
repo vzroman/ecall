@@ -1,4 +1,4 @@
-.PHONY: performance_report
+.PHONY: performance_env performance_report
 
 compile:
 	./rebar3 compile
@@ -17,6 +17,12 @@ test:
 
 performance_tests: compile
 	./rebar3 ct --spec=./test/performance/test.spec
+
+performance_env:
+	docker build \
+		--file test/performance/environment.Dockerfile \
+		--tag ecall-performance-env:otp27 \
+		.
 
 performance_report:
 	cd performance_report && npm install

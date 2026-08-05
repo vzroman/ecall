@@ -10,7 +10,7 @@
 
 -define(STATE_KEY, {?MODULE, state}).
 -define(IMAGE, "ecall-performance:otp27").
--define(BASE_IMAGE, "erlang:27.2.2").
+-define(BASE_IMAGE, "ecall-performance-env:otp27").
 -define(PREBUILT_IMAGE_ENV, "ECALL_PERFORMANCE_PREBUILT_IMAGE").
 -define(COMMAND_TIMEOUT, 30000).
 -define(BUILD_TIMEOUT, 300000).
