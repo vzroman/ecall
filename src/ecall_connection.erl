@@ -103,8 +103,12 @@ call(Node, Module, Function, Args)->
 %%=================================================================
 -spec connect(node()) -> ok | {error, term()}.
 connect( Node )->
-  unregister_connection( Node ),
-  ecall_connection_sup:start_connection( Node ).
+  case connection_info(Node) of
+    {ok, _Info} ->
+      ok;
+    {error, not_connected} ->
+      ecall_connection_sup:start_connection(Node)
+  end.
 
 -spec connection_info(node()) ->
   {ok, #{

@@ -20,6 +20,7 @@
   sender_pid_routes_all_entry_points/1,
   ecall_api_delegates_to_connection/1,
   connection_info_reports_routing_metadata/1,
+  connect_is_idempotent/1,
   reconnect_uses_updated_batch_env/1,
   disconnect_is_idempotent/1,
   pool_member_loss_invalidates_connection_pid/1,
@@ -34,6 +35,7 @@ all() ->
     sender_pid_routes_all_entry_points,
     ecall_api_delegates_to_connection,
     connection_info_reports_routing_metadata,
+    connect_is_idempotent,
     reconnect_uses_updated_batch_env,
     disconnect_is_idempotent,
     pool_member_loss_invalidates_connection_pid,
@@ -77,6 +79,20 @@ connection_info_reports_routing_metadata(_Config) ->
       ConnectionPid = maps:get(connection_pid, Info),
       true = is_pid(ConnectionPid),
       true = erlang:is_process_alive(ConnectionPid)
+    end).
+
+connect_is_idempotent(_Config) ->
+  Node = node(),
+  Remote = fake_remote(),
+  with_fake_receive([Remote],
+    fun() ->
+      ok = ecall_connection:connect(Node),
+      {ok, Info1} = ecall_connection:connection_info(Node),
+      ConnectionPid = maps:get(connection_pid, Info1),
+
+      ok = ecall_connection:connect(Node),
+      {ok, Info2} = ecall_connection:connection_info(Node),
+      ConnectionPid = maps:get(connection_pid, Info2)
     end).
 
 reconnect_uses_updated_batch_env(_Config) ->
