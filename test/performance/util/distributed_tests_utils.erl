@@ -11,6 +11,7 @@
 -define(STATE_KEY, {?MODULE, state}).
 -define(IMAGE, "ecall-performance:otp27").
 -define(BASE_IMAGE, "erlang:27.2.2").
+-define(PREBUILT_IMAGE_ENV, "ECALL_PERFORMANCE_PREBUILT_IMAGE").
 -define(COMMAND_TIMEOUT, 30000).
 -define(BUILD_TIMEOUT, 300000).
 -define(REMOTE_TIMEOUT, 300000).
@@ -29,6 +30,8 @@
 
 -spec start_nodes([map()]) -> [node()].
 start_nodes(NodeConfigs) ->
+  ProjectDir = project_dir(),
+  ensure_local_image(ProjectDir),
   EnvSettings = ct:get_config(env_settings),
   Cookie = ensure_controller_cookie(NodeConfigs),
   Nodes = [start_node(NodeConfig, Cookie, EnvSettings)
@@ -50,11 +53,9 @@ stop_nodes(Nodes) ->
 %%====================================================================
 
 start_node(#{location := local} = Config, Cookie, EnvSettings) ->
-  ProjectDir = project_dir(),
-  ensure_local_image(ProjectDir),
   Name = maps:get(name, Config),
   Container = unique_name(atom_to_list(Name)),
-  Node = node_name(Name, ?LOCAL_NODE_HOST),
+  Node = configured_node(Config, ?LOCAL_NODE_HOST),
   Exec = {os:find_executable("docker"), docker_run_args(Container)},
   start_peer(Node, Exec, Container, local, Config, Cookie, EnvSettings);
 start_node(
@@ -63,10 +64,10 @@ start_node(
                     password := _Password} = Location} = Config,
     Cookie,
     EnvSettings) ->
-  remote_build_image(Location),
+  ensure_remote_image(Location),
   Name = maps:get(name, Config),
   Container = unique_name(atom_to_list(Name)),
-  Node = node_name(Name, Host),
+  Node = configured_node(Config, Host),
   Exec = remote_docker_run_exec(Location, Container),
   start_peer(Node, Exec, Container, {remote, Location}, Config, Cookie, EnvSettings).
 
@@ -126,6 +127,18 @@ docker_run_args(Container) ->
 
 remote_docker_run_exec(Location, Container) ->
   remote_exec(Location, ["docker" | docker_run_args(Container)]).
+
+configured_node(#{location := #{node := Node}}, _DefaultHost) ->
+  node_atom(Node);
+configured_node(#{name := Name}, DefaultHost) ->
+  node_name(Name, DefaultHost).
+
+node_atom(Node) when is_atom(Node) ->
+  Node;
+node_atom(Node) when is_binary(Node) ->
+  binary_to_atom(Node);
+node_atom(Node) when is_list(Node) ->
+  list_to_atom(Node).
 
 node_name(Name, Host) ->
   list_to_atom(atom_to_list(Name) ++ "@" ++ Host).
@@ -324,6 +337,19 @@ put_started_node(Node, NodeState) ->
 %%====================================================================
 
 ensure_local_image(ProjectDir) ->
+  case os:getenv(?PREBUILT_IMAGE_ENV) of
+    "true" ->
+      ensure_prebuilt_image();
+    _BuildLocally ->
+      build_local_image(ProjectDir)
+  end.
+
+ensure_prebuilt_image() ->
+  ct:pal("Using prebuilt performance image ~s", [?IMAGE]),
+  _ImageID = local_image_id(),
+  ok.
+
+build_local_image(ProjectDir) ->
   Dockerfile = filename:join([ProjectDir, "test", "performance", "Dockerfile"]),
   ct:pal("Rebuilding performance image ~s from current source", [?IMAGE]),
   command_ok(
@@ -338,26 +364,46 @@ ensure_local_image(ProjectDir) ->
     ],
     ?BUILD_TIMEOUT).
 
-remote_build_image(Location) ->
-  ProjectDir = project_dir(),
-  Dockerfile = filename:join([ProjectDir, "test", "performance", "Dockerfile"]),
-  RemoteBuild =
-    remote_command_string(
-      Location,
-      [
-        "docker", "build",
-        "--build-arg", "BASE_IMAGE=" ++ ?BASE_IMAGE,
-        "--tag", ?IMAGE,
-        "-"
-      ]),
+ensure_remote_image(Location) ->
+  LocalImageID = local_image_id(),
+  case remote_image_id(Location) of
+    {ok, LocalImageID} ->
+      ct:pal(
+        "Reusing performance image ~s on ~s",
+        [?IMAGE, maps:get(host, Location)]),
+      ok;
+    _Other ->
+      transfer_image(Location)
+  end.
+
+local_image_id() ->
+  Output =
+    command_ok(
+      "inspect local docker image",
+      "docker",
+      ["image", "inspect", "--format={{.Id}}", ?IMAGE],
+      ?COMMAND_TIMEOUT),
+  string:trim(binary_to_list(Output)).
+
+remote_image_id(Location) ->
+  case remote_run(
+         Location,
+         ["docker", "image", "inspect", "--format={{.Id}}", ?IMAGE],
+         ?COMMAND_TIMEOUT) of
+    {0, Output} ->
+      {ok, string:trim(binary_to_list(Output))};
+    _Error ->
+      not_found
+  end.
+
+transfer_image(Location) ->
+  Host = maps:get(host, Location),
+  ct:pal("Transferring performance image ~s to ~s", [?IMAGE, Host]),
+  RemoteLoad = remote_command_string(Location, ["docker", "load"]),
   Command =
-    "tmp=$(mktemp -d) && "
-    "trap 'rm -rf \"$tmp\"' EXIT && "
-    "cp " ++ shell_quote(Dockerfile) ++ " \"$tmp/Dockerfile\" && "
-    "tar -C " ++ shell_quote(ProjectDir) ++ " -cf - . | "
-    "tar -C \"$tmp\" -xf - && "
-    "tar -C \"$tmp\" -cf - . | " ++ RemoteBuild,
-  command_ok("remote docker build", "sh", ["-c", Command], ?REMOTE_TIMEOUT),
+    "docker save " ++ shell_quote(?IMAGE) ++
+    " | gzip -1 | " ++ RemoteLoad,
+  command_ok("remote docker load", "sh", ["-c", Command], ?REMOTE_TIMEOUT),
   ok.
 
 remote_run(Location, RemoteArgs, Timeout) ->

@@ -129,11 +129,16 @@ A remote role is configured directly in CT config:
   sender => local,
   receiver => #{
     host => "receiver.example.net",
+    node => "receiver@distribution.example.net",
     user => "test-user",
     password => "password"
   }
 }}.
 ```
+
+`host` identifies the SSH/Docker host. The optional `node` value is the full
+Erlang node name used for distribution and may use a different hostname or IP
+address. When `node` is omitted, the harness uses `<role>@<host>`.
 
 ## Docker and peer requirements
 
@@ -151,6 +156,21 @@ Remote Docker commands are executed over SSH using the role config.
 ```text
 +zdbbl <distribution_busy_limit_kib>
 ```
+
+### Offline controller
+
+An offline controller can use the locally built
+`ecall-performance-controller:otp27` image. The controller image contains
+Erlang/OTP, Rebar3, Make, SSH, `sshpass`, and the Docker CLI. It uses the host
+Docker daemon and the prebuilt `ecall-performance:otp27` image, so it does not
+download packages or rebuild images on the controller host.
+
+The offline bundle contains both Docker images. Install and run it with
+`test/performance/run_offline_controller.sh`; set
+`ECALL_PERFORMANCE_ARTIFACT_DIR` when the bundle and logs are not under
+`/home/romanvozfp/ecall_tests`. The runner mounts `performance.config` and
+`test.spec` from that artifact directory so both inputs remain editable without
+rebuilding the image.
 
 `+zdbbl` is a startup option measured in KiB. Changing the busy limit requires
 a new peer start. A busy-limit experiment is therefore a new CT invocation or
