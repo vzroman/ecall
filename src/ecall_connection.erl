@@ -208,7 +208,7 @@ get_remote_workers( Node )->
 %%=================================================================
 worker_loop( Remote, BatchSize )->
   Requests = collect_requests( _Count = 0, BatchSize ),
-  catch Remote ! {batch, node(), Requests},
+  catch Remote ! {batch, Requests},
   worker_loop( Remote, BatchSize ).
 
 collect_requests( Count, BatchSize ) when 0 < Count, Count < BatchSize->

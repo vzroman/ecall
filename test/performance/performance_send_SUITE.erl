@@ -31,28 +31,32 @@
 }).
 
 -record(writer, {
-  run_ref,
   path,
-  receiver_node,
   receiver,
   messages_per_writer,
   pace_ms
 }).
 
 -record(receiver, {
-  run_ref,
   controller,
-  writer,
   expected,
   count = 0,
   started_at
 }).
 
--record(state, {
-  point,
-  receiver_done = 0,
-  receiver_count = 0,
-  receiver_elapsed_us = 0
+-record(receiver_controller, {
+  run_ref,
+  controller,
+  expected,
+  pending,
+  completed = 0,
+  message_count = 0,
+  elapsed_us = 0
+}).
+
+-record(receiver_results, {
+  message_count,
+  average_elapsed_us
 }).
 
 
@@ -61,8 +65,8 @@
 %%====================================================================
 
 all() ->
-  [native_test, ecall_test].
-  %[ecall_test].
+  %[native_test, ecall_test].
+  [ecall_test].
 
 init_per_suite(Config) ->
   Performance = performance_settings(),
@@ -158,13 +162,17 @@ run_send_point(Config) ->
     ?PAYLOAD_KEY,
     performance_payloads:new(Point#point.payload_profile)),
   try
+    ReceiverController = start_receiver_controller(Point),
+    Receivers = await_receivers_started(Point, ReceiverController),
     Metrics = performance_metrics:start(),
     try
       ok = performance_metrics:begin_point(Metrics),
-      State0 = start_writers(Point),
-      State1 = await_completion(State0),
+      WriterController = start_writer_controller(Point, Receivers),
+      ReceiverResults =
+        await_receiver_results(Point, ReceiverController),
+      ok = finish_writer_controller(Point, WriterController),
       MetricResults = performance_metrics:finish(Metrics),
-      result_map(Point, State1, MetricResults)
+      result_map(Point, ReceiverResults, MetricResults)
     after
       performance_metrics:abort(Metrics)
     end
@@ -187,82 +195,218 @@ send_point(Config) ->
     metadata = maps:get(metadata, Config, #{})
   }.
 
-start_writers(#point{writer_count = WriterCount} = Point) ->
-  Coordinator = self(),
+start_receiver_controller(#point{
+    run_ref = RunRef,
+    receiver_node = ReceiverNode,
+    writer_count = ReceiverCount,
+    messages_per_writer = MessagesPerReceiver}) ->
+  Controller = self(),
+  spawn_link(
+    fun() ->
+      receiver_controller(
+        Controller,
+        RunRef,
+        ReceiverNode,
+        ReceiverCount,
+        MessagesPerReceiver)
+    end).
+
+await_receivers_started(
+    #point{run_ref = RunRef, writer_count = WriterCount},
+    ReceiverController) ->
+  receive
+    {?TAG, RunRef, ReceiverController, receivers_started, Receivers}
+        when length(Receivers) =:= WriterCount ->
+      Receivers;
+    Message ->
+      exit({unexpected_point_message, Message})
+  end.
+
+start_writer_controller(Point, Receivers) ->
+  Controller = self(),
   Writer = #writer{
-    run_ref = Point#point.run_ref,
     path = Point#point.path,
-    receiver_node = Point#point.receiver_node,
     messages_per_writer = Point#point.messages_per_writer,
     pace_ms = Point#point.pace_ms
   },
-  ok = start_writers(WriterCount, Writer, Coordinator),
-  #state{point = Point}.
+  spawn_link(
+    fun() ->
+      writer_controller(
+        Controller,
+        Point#point.run_ref,
+        Writer,
+        Receivers)
+    end).
 
-start_writers(0, _Writer, _Coordinator) ->
-  ok;
-start_writers(Count, Writer, Coordinator) ->
-  _ = spawn_link(fun() -> writer_loop(Writer, Coordinator) end),
-  start_writers(Count - 1, Writer, Coordinator).
-
-await_completion(#state{
-    point = #point{writer_count = WriterCount, expected = Expected},
-    receiver_done = WriterCount,
-    receiver_count = Expected} = State) ->
-  State;
-await_completion(State) ->
+await_receiver_results(
+    #point{run_ref = RunRef, expected = Expected},
+    ReceiverController) ->
   receive
+    {?TAG, RunRef, ReceiverController, receiver_results,
+        #receiver_results{message_count = Expected} = Results} ->
+      Results;
     Message ->
-      await_completion(handle_completion_message(Message, State))
+      exit({unexpected_point_message, Message})
   end.
 
-handle_completion_message(
-    {?TAG, RunRef, receiver_completed, Receiver, Count, ElapsedUs},
-    State)
-    when RunRef =:= (State#state.point)#point.run_ref,
-         is_pid(Receiver),
-         is_integer(ElapsedUs),
-         ElapsedUs >= 0 ->
-  Count = (State#state.point)#point.messages_per_writer,
-  State#state{
-    receiver_done = State#state.receiver_done + 1,
-    receiver_count = State#state.receiver_count + Count,
-    receiver_elapsed_us = State#state.receiver_elapsed_us + ElapsedUs
-  };
-handle_completion_message(Message, _State) ->
-  exit({unexpected_completion_message, Message}).
+finish_writer_controller(
+    #point{run_ref = RunRef}, WriterController) ->
+  WriterController ! {?TAG, RunRef, self(), finish},
+  receive
+    {?TAG, RunRef, WriterController, finished} ->
+      ok;
+    Message ->
+      exit({unexpected_point_message, Message})
+  end.
 
 
 %%====================================================================
-%% Writers and receivers
+%% Receiver controller and receivers
 %%====================================================================
 
-writer_loop(Writer, Coordinator) ->
-  Receiver = start_receiver(Writer, Coordinator),
-  ok = writer_operations(1, Writer#writer{receiver = Receiver}),
-  await_receiver(Writer#writer.run_ref, Receiver).
+receiver_controller(
+    Controller,
+    RunRef,
+    ReceiverNode,
+    ReceiverCount,
+    MessagesPerReceiver) ->
+  Receivers =
+    start_receivers(
+      ReceiverCount,
+      ReceiverNode,
+      MessagesPerReceiver,
+      []),
+  Controller !
+    {?TAG, RunRef, self(), receivers_started, Receivers},
+  Pending = maps:from_list([{Receiver, true} || Receiver <- Receivers]),
+  receiver_controller_loop(
+    #receiver_controller{
+      run_ref = RunRef,
+      controller = Controller,
+      expected = MessagesPerReceiver,
+      pending = Pending
+    }).
 
-start_receiver(#writer{
-    run_ref = RunRef,
-    receiver_node = ReceiverNode,
-    messages_per_writer = Expected}, Coordinator) ->
+start_receivers(0, _ReceiverNode, _Expected, Receivers) ->
+  Receivers;
+start_receivers(Count, ReceiverNode, Expected, Receivers) ->
+  Receiver = start_receiver(ReceiverNode, Expected),
+  start_receivers(
+    Count - 1,
+    ReceiverNode,
+    Expected,
+    [Receiver | Receivers]).
+
+start_receiver(ReceiverNode, Expected) ->
   Receiver = #receiver{
-    run_ref = RunRef,
-    controller = Coordinator,
-    writer = self(),
+    controller = self(),
     expected = Expected
   },
   spawn_link(
     ReceiverNode,
     fun() -> receiver_loop(Receiver) end).
 
-await_receiver(RunRef, Receiver) ->
+receiver_controller_loop(State) ->
   receive
-    {?TAG, RunRef, receiver_finished, Receiver} ->
+    {?TAG, completed, Receiver, Count, ElapsedUs}
+        when Count =:= State#receiver_controller.expected,
+             is_integer(ElapsedUs),
+             ElapsedUs >= 0 ->
+      receiver_completed(Receiver, Count, ElapsedUs, State);
+    Message ->
+      exit({unexpected_receiver_controller_message, Message})
+  end.
+
+receiver_completed(Receiver, Count, ElapsedUs, State) ->
+  {true, Pending} =
+    maps:take(Receiver, State#receiver_controller.pending),
+  State1 = State#receiver_controller{
+    pending = Pending,
+    completed = State#receiver_controller.completed + 1,
+    message_count = State#receiver_controller.message_count + Count,
+    elapsed_us = State#receiver_controller.elapsed_us + ElapsedUs
+  },
+  receiver_controller_continue(State1).
+
+receiver_controller_continue(
+    #receiver_controller{pending = Pending} = State)
+    when map_size(Pending) > 0 ->
+  receiver_controller_loop(State);
+receiver_controller_continue(State) ->
+  Results = #receiver_results{
+    message_count = State#receiver_controller.message_count,
+    average_elapsed_us =
+      State#receiver_controller.elapsed_us /
+        State#receiver_controller.completed
+  },
+  State#receiver_controller.controller !
+    {?TAG,
+     State#receiver_controller.run_ref,
+     self(),
+     receiver_results,
+     Results},
+  ok.
+
+receiver_loop(#receiver{
+    controller = Controller,
+    expected = Expected,
+    count = Count,
+    started_at = StartedAt} = Receiver) ->
+  receive
+    _Payload ->
+      ReceivedAt = erlang:monotonic_time(microsecond),
+      StartedAt1 = receiver_started_at(Count, StartedAt, ReceivedAt),
+      Count1 = Count + 1,
+      receiver_continue(
+        Count1,
+        Expected,
+        ReceivedAt - StartedAt1,
+        Receiver#receiver{count = Count1, started_at = StartedAt1},
+        Controller)
+  end.
+
+receiver_continue(Count, Count, ElapsedUs, _Receiver, Controller) ->
+  Controller ! {?TAG, completed, self(), Count, ElapsedUs},
+  ok;
+receiver_continue(Count, Expected, _ElapsedUs, Receiver, _Controller)
+    when Count < Expected ->
+  receiver_loop(Receiver);
+receiver_continue(Count, Expected, _ElapsedUs, _Receiver, _Controller) ->
+  exit({too_many_messages, Count, Expected}).
+
+receiver_started_at(0, undefined, ReceivedAt) ->
+  ReceivedAt;
+receiver_started_at(_Count, StartedAt, _ReceivedAt) ->
+  StartedAt.
+
+
+%%====================================================================
+%% Writer controller and writers
+%%====================================================================
+
+writer_controller(Controller, RunRef, Writer, Receivers) ->
+  ok = start_writers(Receivers, Writer),
+  await_finish(Controller, RunRef).
+
+start_writers([], _Writer) ->
+  ok;
+start_writers([Receiver | Receivers], Writer) ->
+  _ =
+    spawn_link(
+      fun() -> writer_loop(Writer#writer{receiver = Receiver}) end),
+  start_writers(Receivers, Writer).
+
+await_finish(Controller, RunRef) ->
+  receive
+    {?TAG, RunRef, Controller, finish} ->
+      Controller ! {?TAG, RunRef, self(), finished},
       ok;
     Message ->
-      exit({unexpected_writer_message, Message})
+      exit({unexpected_writer_controller_message, Message})
   end.
+
+writer_loop(Writer) ->
+  writer_operations(1, Writer).
 
 writer_operations(Seq, #writer{messages_per_writer = Max})
     when Seq > Max ->
@@ -287,45 +431,12 @@ send_operation(#writer{path = ecall, receiver = Receiver}) ->
   _ = ecall:send(Receiver, Payload),
   ok.
 
-receiver_loop(#receiver{
-    run_ref = RunRef,
-    controller = Controller,
-    writer = Writer,
-    expected = Expected,
-    count = Count,
-    started_at = StartedAt} = Receiver) ->
-  receive
-    _Payload ->
-      ReceivedAt = erlang:monotonic_time(microsecond),
-      StartedAt1 = receiver_started_at(Count, StartedAt, ReceivedAt),
-      Count1 = Count + 1,
-      case Count1 of
-        Expected ->
-          ElapsedUs = ReceivedAt - StartedAt1,
-          Controller !
-            {?TAG, RunRef, receiver_completed, self(), Count1, ElapsedUs},
-          Writer ! {?TAG, RunRef, receiver_finished, self()},
-          ok;
-        _ when Count1 < Expected ->
-          receiver_loop(
-            Receiver#receiver{count = Count1, started_at = StartedAt1});
-        _ ->
-          exit({too_many_messages, Count1, Expected})
-      end
-  end.
-
-receiver_started_at(0, undefined, ReceivedAt) ->
-  ReceivedAt;
-receiver_started_at(_Count, StartedAt, _ReceivedAt) ->
-  StartedAt.
-
-
 %%====================================================================
 %% Reporting
 %%====================================================================
 
-result_map(Point, State, Metrics) ->
-  ElapsedMs = average_elapsed_ms(State),
+result_map(Point, ReceiverResults, Metrics) ->
+  ElapsedMs = average_elapsed_ms(ReceiverResults),
   Base = #{
     suite => ?MODULE,
     operation => send,
@@ -338,7 +449,7 @@ result_map(Point, State, Metrics) ->
     elapsed_ms => ElapsedMs,
     performance_percent =>
       performance_percent(
-        State#state.receiver_count,
+        ReceiverResults#receiver_results.message_count,
         Point#point.writer_count,
         Point#point.pace_ms,
         ElapsedMs),
@@ -346,10 +457,9 @@ result_map(Point, State, Metrics) ->
   },
   maps:merge(Base, Point#point.metadata).
 
-average_elapsed_ms(#state{
-    point = #point{writer_count = WriterCount},
-    receiver_elapsed_us = ElapsedUs}) ->
-  ElapsedUs / (WriterCount * 1000).
+average_elapsed_ms(
+    #receiver_results{average_elapsed_us = AverageElapsedUs}) ->
+  AverageElapsedUs / 1000.
 
 performance_percent(_Completed, _WriterCount, _PaceMs, ElapsedMs)
     when ElapsedMs == 0 ->

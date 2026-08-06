@@ -49,7 +49,7 @@ master_loop( Workers )->
 
 worker_loop( State )->
   receive
-    {batch, _Node, Batch}->
+    {batch, Batch}->
       State1 = handle_batch(Batch, State),
       worker_loop( State1 );
     {'DOWN', _, process, PID, Reason}->
