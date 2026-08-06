@@ -15,8 +15,7 @@
 -define(DISTRIBUTION_LOCK, dist_entry_out_queue).
 
 -record(collector, {
-  pid,
-  monitor
+  pid
 }).
 
 -record(state, {
@@ -39,12 +38,10 @@
 start() ->
   Owner = self(),
   Ref = make_ref(),
-  {Pid, Monitor} = spawn_monitor(fun() -> collector_init(Owner, Ref) end),
+  Pid = spawn_link(fun() -> collector_init(Owner, Ref) end),
   receive
     {?TAG, Ref, Pid, ready} ->
-      #collector{pid = Pid, monitor = Monitor};
-    {'DOWN', Monitor, process, Pid, Reason} ->
-      exit({metrics_collector_start_failed, Reason})
+      #collector{pid = Pid}
   end.
 
 -spec begin_point(collector()) -> ok.
@@ -53,22 +50,17 @@ begin_point(Collector) ->
   ok.
 
 -spec finish(collector()) -> map().
-finish(#collector{monitor = Monitor} = Collector) ->
+finish(Collector) ->
   {finished, Result} = request(Collector, finish),
-  erlang:demonitor(Monitor, [flush]),
   Result.
 
--spec handle_down(term(), collector()) -> not_collector | no_return().
-handle_down(
-    {'DOWN', Monitor, process, Pid, Reason},
-    #collector{pid = Pid, monitor = Monitor}) ->
-  exit({metrics_collector_failed, Reason});
+-spec handle_down(term(), collector()) -> not_collector.
 handle_down(_Message, _Collector) ->
   not_collector.
 
 -spec abort(collector()) -> ok.
-abort(#collector{pid = Pid, monitor = Monitor}) ->
-  erlang:demonitor(Monitor, [flush]),
+abort(#collector{pid = Pid}) ->
+  unlink(Pid),
   exit(Pid, kill),
   ok.
 
@@ -122,14 +114,12 @@ point_filename(#{
 %% Collector protocol
 %%====================================================================
 
-request(#collector{pid = Pid, monitor = Monitor}, Request) ->
+request(#collector{pid = Pid}, Request) ->
   Ref = make_ref(),
   Pid ! {?TAG, Ref, self(), Request},
   receive
     {?TAG, Ref, Pid, Reply} ->
-      Reply;
-    {'DOWN', Monitor, process, Pid, Reason} ->
-      exit({metrics_collector_failed, Reason})
+      Reply
   end.
 
 
