@@ -28,7 +28,7 @@ init_pool()->
 
   register( ?MODULE, self() ),
 
-  PoolSize = erlang:system_info(logical_processors),
+  PoolSize = application:get_env(ecall, pool_size, ?POOL_SIZE),
 
   Workers =
     [ spawn_link(fun()-> worker_loop(#state{}) end) || _ <- lists:seq(1, PoolSize)],
