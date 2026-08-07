@@ -665,32 +665,32 @@ horizontal variable for both grids and charts.
 
 Grid columns are the writer counts sorted numerically in ascending order. Grid
 rows identify the path and metric, for example native performance percentage,
-`ecall` performance percentage, native average memory, and `ecall` average
+`ecall` performance percentage, native maximum memory, and `ecall` maximum
 memory.
 
 Charts use a numeric `writer_count` X axis. Native and `ecall` are separate
 series. The reported trends cover:
 
 - performance percentage;
-- average memory;
 - maximum memory;
 - lock wait;
 - lock collision percentage;
-- lock duration percentage;
-- distribution socket writes (`send_count`);
-- distribution bytes sent (`send_octets`);
+- distribution throughput (`send_octets` divided by the elapsed seconds);
 - average distribution packet size;
 - maximum distribution send-pending bytes;
 - maximum distribution port queue size;
-- maximum distribution port memory;
-- busy-dist-port suspensions;
-- distinct suspended writers.
+- busy-dist-port suspensions.
+
+The point result still records `send_count`, `send_octets`, `port_memory`, and
+`busy_dist_port_writers`; they are collected but not charted. Throughput is
+derived in the report from `send_octets` and the point `elapsed_ms`, and is
+reported in decimal megabytes per second.
 
 Network trends are absent for schema-version-1 points and are shown as gaps or
 `N/A`; they are never converted to zero.
 
-Average and maximum memory are stored as bytes but converted to decimal
-gigabytes (bytes divided by `1,000,000,000`) in both grids and charts.
+Maximum memory is stored as bytes but converted to decimal gigabytes (bytes
+divided by `1,000,000,000`) in both grids and charts.
 
 A series is identified by the run, operation, payload, path, messages per
 writer, pace, distribution busy limit, sender, receiver, and metric. Each

@@ -164,7 +164,8 @@ init_connection(Node, Sup)->
       BatchSize = application:get_env(ecall, batch_size, ?BATCH_SIZE),
       Pool =
         maps:from_list(
-          [ {I,spawn_link(fun()->worker_loop(W, BatchSize) end)}
+          [ {I,spawn_opt(fun()->worker_loop(W, BatchSize) end,
+                         [link, {message_queue_data, off_heap}])}
             || {I, W} <-
                  lists:zip(lists:seq(0, length(Workers)-1), Workers) ]),
 
@@ -207,6 +208,7 @@ get_remote_workers( Node )->
 %% WORKER LOOP
 %%=================================================================
 worker_loop( Remote, BatchSize )->
+  erlang:garbage_collect(self()),
   Requests = collect_requests( _Count = 0, BatchSize ),
   catch Remote ! {batch, Requests},
   worker_loop( Remote, BatchSize ).

@@ -31,7 +31,9 @@ init_pool()->
   PoolSize = application:get_env(ecall, pool_size, ?POOL_SIZE),
 
   Workers =
-    [ spawn_link(fun()-> worker_loop(#state{}) end) || _ <- lists:seq(1, PoolSize)],
+    [ spawn_opt(fun()-> worker_loop(#state{}) end,
+                [link, {message_queue_data, off_heap}])
+      || _ <- lists:seq(1, PoolSize)],
 
   pg:join(?pg_scope, ?pg_group, self() ),
 
@@ -48,6 +50,7 @@ master_loop( Workers )->
 
 
 worker_loop( State )->
+  erlang:garbage_collect(self()),
   receive
     {batch, Batch}->
       State1 = handle_batch(Batch, State),

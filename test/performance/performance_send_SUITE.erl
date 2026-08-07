@@ -65,8 +65,8 @@
 %%====================================================================
 
 all() ->
-  %[native_test, ecall_test].
-  [ecall_test].
+  [native_test, ecall_test].
+  %[ecall_test].
 
 init_per_suite(Config) ->
   Performance = performance_settings(),
