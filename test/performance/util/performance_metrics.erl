@@ -2,7 +2,7 @@
 
 %% API
 -export([
-  start/0,
+  start/1,
   begin_point/1,
   finish/1,
   handle_down/2,
@@ -13,17 +13,33 @@
 -define(TAG, ?MODULE).
 -define(SAMPLE_INTERVAL_MS, 100).
 -define(DISTRIBUTION_LOCK, dist_entry_out_queue).
+-define(SCHEMA_VERSION, 2).
 
 -record(collector, {
   pid
 }).
 
 -record(state, {
+  receiver_node,
+  dist_port,
+  prev_monitor,
   sample_ref,
   timer_ref,
   sample_count = 0,
   memory_sum = 0,
-  memory_max = 0
+  memory_max = 0,
+  send_oct_base = 0,
+  send_cnt_base = 0,
+  send_oct_final = 0,
+  send_cnt_final = 0,
+  send_pend_sum = 0,
+  send_pend_max = 0,
+  queue_size_sum = 0,
+  queue_size_max = 0,
+  port_memory_sum = 0,
+  port_memory_max = 0,
+  busy_events = 0,
+  busy_writers = #{}
 }).
 
 -opaque collector() :: #collector{}.
@@ -34,11 +50,11 @@
 %% API
 %%====================================================================
 
--spec start() -> collector().
-start() ->
+-spec start(node()) -> collector().
+start(ReceiverNode) ->
   Owner = self(),
   Ref = make_ref(),
-  Pid = spawn_link(fun() -> collector_init(Owner, Ref) end),
+  Pid = spawn_link(fun() -> collector_init(Owner, Ref, ReceiverNode) end),
   receive
     {?TAG, Ref, Pid, ready} ->
       #collector{pid = Pid}
@@ -69,7 +85,7 @@ point(Config, Result) ->
   EnvSettings = ct:get_config(env_settings),
   RoleConfig = ct:get_config(role_config),
   StoredResult = Result#{
-    schema_version => 1,
+    schema_version => ?SCHEMA_VERSION,
     distribution_busy_limit_kib =>
       maps:get(distribution_busy_limit_kib, EnvSettings),
     sender_config => role_description(maps:get(sender, RoleConfig)),
@@ -127,21 +143,22 @@ request(#collector{pid = Pid}, Request) ->
 %% Collector process
 %%====================================================================
 
-collector_init(Owner, Ref) ->
+collector_init(Owner, Ref, ReceiverNode) ->
   ok = lcnt:rt_mask([distribution]),
   _ = erlang:memory(total),
   Owner ! {?TAG, Ref, self(), ready},
-  collector_wait(#state{}).
+  collector_wait(#state{receiver_node = ReceiverNode}).
 
 collector_wait(State) ->
   receive
     {?TAG, Ref, From, begin_point} ->
+      State1 = begin_network(State),
       ok = lcnt:clear(),
       SampleRef = make_ref(),
-      State1 = sample(State#state{sample_ref = SampleRef}),
+      State2 = sample(State1#state{sample_ref = SampleRef}),
       TimerRef = schedule_sample(SampleRef),
       From ! {?TAG, Ref, self(), begun},
-      collector_loop(State1#state{timer_ref = TimerRef});
+      collector_loop(State2#state{timer_ref = TimerRef});
     Message ->
       exit({unexpected_metrics_message, Message})
   end.
@@ -152,10 +169,13 @@ collector_loop(#state{sample_ref = SampleRef} = State) ->
       State1 = sample(State),
       TimerRef = schedule_sample(SampleRef),
       collector_loop(State1#state{timer_ref = TimerRef});
+    {monitor, SusPid, busy_dist_port, _Port} ->
+      collector_loop(record_busy(SusPid, State));
     {?TAG, Ref, From, finish} ->
       cancel_sample(State#state.timer_ref),
       State1 = sample(State),
-      Result = result(State1),
+      State2 = finish_network(State1),
+      Result = result(State2),
       From ! {?TAG, Ref, self(), {finished, Result}},
       ok;
     Message ->
@@ -174,27 +194,143 @@ cancel_sample(TimerRef) ->
 %%====================================================================
 
 sample(#state{
+    dist_port = DistPort,
     sample_count = SampleCount,
     memory_sum = MemorySum,
-    memory_max = MemoryMax} = State) ->
+    memory_max = MemoryMax,
+    send_pend_sum = SendPendSum,
+    send_pend_max = SendPendMax,
+    queue_size_sum = QueueSizeSum,
+    queue_size_max = QueueSizeMax,
+    port_memory_sum = PortMemorySum,
+    port_memory_max = PortMemoryMax} = State) ->
   Memory = erlang:memory(total),
+  SendPend = socket_send_pend(DistPort),
+  QueueSize = port_queue_size(DistPort),
+  PortMemory = port_memory(DistPort),
   State#state{
     sample_count = SampleCount + 1,
     memory_sum = MemorySum + Memory,
-    memory_max = erlang:max(MemoryMax, Memory)
+    memory_max = erlang:max(MemoryMax, Memory),
+    send_pend_sum = SendPendSum + SendPend,
+    send_pend_max = erlang:max(SendPendMax, SendPend),
+    queue_size_sum = QueueSizeSum + QueueSize,
+    queue_size_max = erlang:max(QueueSizeMax, QueueSize),
+    port_memory_sum = PortMemorySum + PortMemory,
+    port_memory_max = erlang:max(PortMemoryMax, PortMemory)
   }.
 
 result(#state{
     sample_count = SampleCount,
     memory_sum = MemorySum,
-    memory_max = MemoryMax}) ->
+    memory_max = MemoryMax} = State) ->
   #{
     memory => #{
       average_bytes => MemorySum / SampleCount,
       maximum_bytes => MemoryMax
     },
-    locks => lock_results()
+    locks => lock_results(),
+    network => network_result(State)
   }.
+
+
+%%====================================================================
+%% Network metrics
+%%====================================================================
+
+begin_network(#state{receiver_node = ReceiverNode} = State) ->
+  DistPort = resolve_dist_port(ReceiverNode),
+  {SendOct, SendCnt} = socket_counters(DistPort),
+  PrevMonitor = erlang:system_monitor(self(), [busy_dist_port]),
+  State#state{
+    dist_port = DistPort,
+    prev_monitor = PrevMonitor,
+    send_oct_base = SendOct,
+    send_cnt_base = SendCnt
+  }.
+
+finish_network(#state{dist_port = DistPort, prev_monitor = PrevMonitor} = State) ->
+  {SendOct, SendCnt} = socket_counters(DistPort),
+  _ = erlang:system_monitor(PrevMonitor),
+  State1 = drain_busy(State),
+  State1#state{send_oct_final = SendOct, send_cnt_final = SendCnt}.
+
+drain_busy(State) ->
+  receive
+    {monitor, SusPid, busy_dist_port, _Port} ->
+      drain_busy(record_busy(SusPid, State))
+  after
+    0 -> State
+  end.
+
+record_busy(SusPid, #state{busy_events = Events, busy_writers = Writers} = State) ->
+  State#state{
+    busy_events = Events + 1,
+    busy_writers = Writers#{SusPid => []}
+  }.
+
+resolve_dist_port(ReceiverNode) ->
+  {ReceiverNode, DistPort} =
+    lists:keyfind(ReceiverNode, 1, erlang:system_info(dist_ctrl)),
+  DistPort.
+
+socket_counters(DistPort) ->
+  {ok, Stats} = inet:getstat(DistPort, [send_oct, send_cnt]),
+  {proplists:get_value(send_oct, Stats),
+   proplists:get_value(send_cnt, Stats)}.
+
+socket_send_pend(DistPort) ->
+  {ok, [{send_pend, SendPend}]} = inet:getstat(DistPort, [send_pend]),
+  SendPend.
+
+port_queue_size(DistPort) ->
+  {queue_size, QueueSize} = erlang:port_info(DistPort, queue_size),
+  QueueSize.
+
+port_memory(DistPort) ->
+  {memory, Memory} = erlang:port_info(DistPort, memory),
+  Memory.
+
+network_result(#state{
+    sample_count = SampleCount,
+    send_oct_base = SendOctBase,
+    send_cnt_base = SendCntBase,
+    send_oct_final = SendOctFinal,
+    send_cnt_final = SendCntFinal,
+    send_pend_sum = SendPendSum,
+    send_pend_max = SendPendMax,
+    queue_size_sum = QueueSizeSum,
+    queue_size_max = QueueSizeMax,
+    port_memory_sum = PortMemorySum,
+    port_memory_max = PortMemoryMax,
+    busy_events = BusyEvents,
+    busy_writers = BusyWriters}) ->
+  SendOct = SendOctFinal - SendOctBase,
+  SendCnt = SendCntFinal - SendCntBase,
+  #{
+    send_octets => SendOct,
+    send_count => SendCnt,
+    average_packet_bytes => average_packet(SendOct, SendCnt),
+    send_pending => #{
+      average_bytes => SendPendSum / SampleCount,
+      maximum_bytes => SendPendMax
+    },
+    port_queue_size => #{
+      average_bytes => QueueSizeSum / SampleCount,
+      maximum_bytes => QueueSizeMax
+    },
+    port_memory => #{
+      average_bytes => PortMemorySum / SampleCount,
+      maximum_bytes => PortMemoryMax
+    },
+    busy_dist_port_events => BusyEvents,
+    busy_dist_port_writers => map_size(BusyWriters)
+  }.
+
+average_packet(_SendOct, 0) ->
+  0.0;
+average_packet(SendOct, SendCnt) ->
+  SendOct / SendCnt.
 
 
 %%====================================================================

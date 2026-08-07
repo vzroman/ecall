@@ -5,7 +5,48 @@ import path from 'node:path';
 import test from 'node:test';
 import {scanRuns} from './report-data.js';
 
+function validNetwork(overrides = {}) {
+  return {
+    send_octets: 4096,
+    send_count: 8,
+    average_packet_bytes: 512,
+    send_pending: {average_bytes: 100, maximum_bytes: 200},
+    port_queue_size: {average_bytes: 300, maximum_bytes: 400},
+    port_memory: {average_bytes: 500, maximum_bytes: 600},
+    busy_dist_port_events: 3,
+    busy_dist_port_writers: 2,
+    ...overrides
+  };
+}
+
 function validPoint(overrides = {}) {
+  return {
+    schema_version: 2,
+    operation: 'send',
+    path: 'native',
+    payload: 'tiny',
+    writer_count: 10,
+    messages_per_writer: 100,
+    pace_ms: 10,
+    distribution_busy_limit_kib: 1024,
+    sender_config: 'local',
+    receiver_config: 'runner@receiver.example.net',
+    elapsed_ms: 1000,
+    performance_percent: 100,
+    metrics: {
+      memory: {average_bytes: 1000, maximum_bytes: 1200},
+      locks: {
+        wait_us: 50,
+        collision_percent: 1.5,
+        duration_percent: 0.5
+      },
+      network: validNetwork()
+    },
+    ...overrides
+  };
+}
+
+function legacyPoint(overrides = {}) {
   return {
     schema_version: 1,
     operation: 'send',
@@ -117,6 +158,84 @@ test('skips JSON that does not match the point schema', async () => {
       error => error.message.endsWith('sender_config')));
     assert.ok(result.runs[0].errors.some(
       error => error.message.endsWith('receiver_config')));
+  } finally {
+    await rm(temporaryRoot, {recursive: true, force: true});
+  }
+});
+
+test('rejects schema-version-2 points with invalid network metrics', async () => {
+  const temporaryRoot = await mkdtemp(
+    path.join(os.tmpdir(), 'ecall-performance-report-network-'));
+  try {
+    const dataDirectory = path.join(
+      temporaryRoot,
+      'ct_run.network',
+      'performance_send_SUITE.logs',
+      'log_private',
+      'performance_data');
+    await mkdir(dataDirectory, {recursive: true});
+    await writeFile(
+      path.join(dataDirectory, 'missing-network.json'),
+      JSON.stringify(validPoint({
+        metrics: {
+          memory: {average_bytes: 1000, maximum_bytes: 1200},
+          locks: {wait_us: 50, collision_percent: 1.5, duration_percent: 0.5}
+        }
+      })));
+    await writeFile(
+      path.join(dataDirectory, 'bad-gauge.json'),
+      JSON.stringify(validPoint({
+        metrics: {
+          memory: {average_bytes: 1000, maximum_bytes: 1200},
+          locks: {wait_us: 50, collision_percent: 1.5, duration_percent: 0.5},
+          network: validNetwork({send_pending: {average_bytes: 100}})
+        }
+      })));
+    await writeFile(
+      path.join(dataDirectory, 'bad-writers.json'),
+      JSON.stringify(validPoint({
+        metrics: {
+          memory: {average_bytes: 1000, maximum_bytes: 1200},
+          locks: {wait_us: 50, collision_percent: 1.5, duration_percent: 0.5},
+          network: validNetwork({busy_dist_port_writers: -1})
+        }
+      })));
+
+    const result = await scanRuns(temporaryRoot);
+
+    assert.equal(result.runs[0].points.length, 0);
+    assert.equal(result.runs[0].errors.length, 3);
+    assert.ok(result.runs[0].errors.some(
+      error => error.message.endsWith('metrics.network')));
+    assert.ok(result.runs[0].errors.some(
+      error => error.message.endsWith('metrics.network.send_pending.maximum_bytes')));
+    assert.ok(result.runs[0].errors.some(
+      error => error.message.endsWith('metrics.network.busy_dist_port_writers')));
+  } finally {
+    await rm(temporaryRoot, {recursive: true, force: true});
+  }
+});
+
+test('accepts legacy schema-version-1 points without network metrics', async () => {
+  const temporaryRoot = await mkdtemp(
+    path.join(os.tmpdir(), 'ecall-performance-report-legacy-v1-'));
+  try {
+    const dataDirectory = path.join(
+      temporaryRoot,
+      'ct_run.legacy_v1',
+      'performance_send_SUITE.logs',
+      'log_private',
+      'performance_data');
+    await mkdir(dataDirectory, {recursive: true});
+    await writeFile(
+      path.join(dataDirectory, 'legacy.json'),
+      JSON.stringify(legacyPoint()));
+
+    const result = await scanRuns(temporaryRoot);
+
+    assert.equal(result.runs[0].points.length, 1);
+    assert.equal(result.runs[0].errors.length, 0);
+    assert.equal(result.runs[0].points[0].schema_version, 1);
   } finally {
     await rm(temporaryRoot, {recursive: true, force: true});
   }

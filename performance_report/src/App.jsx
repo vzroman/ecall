@@ -29,7 +29,15 @@ const metrics = [
   {id: 'maximum_memory', label: 'Maximum memory', unit: 'GB', value: point => point.metrics?.memory?.maximum_bytes / 1_000_000_000},
   {id: 'lock_wait', label: 'Lock wait', unit: 'µs', value: point => point.metrics?.locks?.wait_us},
   {id: 'lock_collision', label: 'Lock collisions', unit: '%', value: point => point.metrics?.locks?.collision_percent},
-  {id: 'lock_duration', label: 'Lock duration', unit: '%', value: point => point.metrics?.locks?.duration_percent}
+  {id: 'lock_duration', label: 'Lock duration', unit: '%', value: point => point.metrics?.locks?.duration_percent},
+  {id: 'net_send_count', label: 'Socket writes', unit: '', value: point => point.metrics?.network?.send_count},
+  {id: 'net_send_octets', label: 'Bytes sent', unit: 'GB', value: point => point.metrics?.network?.send_octets / 1_000_000_000},
+  {id: 'net_packet', label: 'Avg packet', unit: 'B', value: point => point.metrics?.network?.average_packet_bytes},
+  {id: 'net_send_pending', label: 'Max send pending', unit: 'MB', value: point => point.metrics?.network?.send_pending?.maximum_bytes / 1_000_000},
+  {id: 'net_queue', label: 'Max port queue', unit: 'MB', value: point => point.metrics?.network?.port_queue_size?.maximum_bytes / 1_000_000},
+  {id: 'net_port_memory', label: 'Max port memory', unit: 'MB', value: point => point.metrics?.network?.port_memory?.maximum_bytes / 1_000_000},
+  {id: 'net_busy_events', label: 'Busy-port suspensions', unit: '', value: point => point.metrics?.network?.busy_dist_port_events},
+  {id: 'net_busy_writers', label: 'Suspended writers', unit: '', value: point => point.metrics?.network?.busy_dist_port_writers}
 ];
 
 function configKey(point) {
@@ -115,7 +123,7 @@ function formatValue(value, unit) {
     undefined,
     {maximumFractionDigits}
   ).format(value);
-  return `${formatted} ${unit}`;
+  return unit === '' ? formatted : `${formatted} ${unit}`;
 }
 
 function MetricGrid({group, writerCounts}) {

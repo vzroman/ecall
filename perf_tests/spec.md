@@ -455,21 +455,27 @@ appropriate.
 
 ## Point metrics
 
-Every successful point collects memory and lock metrics from the sender node.
+Every successful point collects memory, lock, and network metrics from the
+sender node.
 
 ### Collector lifecycle
 
 After the writers and targets have reached the start barrier, the sender
-coordinator starts one local metrics collector and waits until it is ready.
+coordinator starts one local metrics collector for the receiver node and waits
+until it is ready.
 
 The measured point follows this sequence:
 
-1. Start the sender metrics collector.
-2. Clear lock counters on the sender node.
+1. Start the sender metrics collector for the receiver node.
+2. Resolve the distribution channel to the receiver, read the baseline
+   distribution socket counters, enable the busy-dist-port system monitor, and
+   clear lock counters on the sender node.
 3. Record the point start time and release the writers.
-4. Collect memory metrics every 100 milliseconds.
+4. Every 100 milliseconds, sample total memory and the distribution channel
+   backpressure gauges.
 5. Stop collection when the point completion condition is met.
-6. Collect the lock-counter results and build the point result.
+6. Read the final distribution socket counters, restore the previous system
+   monitor, collect the lock-counter results, and build the point result.
 
 The collector keeps aggregates only. It does not retain or log the complete
 sample series, and it does not report sampling-health metrics. There are no
@@ -497,6 +503,60 @@ narrowest category supported by OTP for this lock. The result retains only
 `dist_entry_out_queue` and combines all of its instances. No other locks are
 reported. The result contains accumulated wait time, collision percentage, and
 duration percentage. Lock counters are not sampled every 100 milliseconds.
+
+### Network metrics
+
+Network metrics describe the single Erlang distribution channel from the sender
+to the receiver node. Native and `ecall` points share that one channel, so the
+metrics are directly comparable: batching should reduce the number of socket
+writes and busy-port suspensions, not the payload byte volume.
+
+The collector resolves the channel once, at `begin_point`, from
+`erlang:system_info(dist_ctrl)`, selecting the controlling entity for the
+receiver node. On the default `inet_tcp_dist` transport used by the harness this
+is the `tcp_inet` distribution port. If the receiver is not connected, resolving
+the port fails and the point fails, consistent with the crash-forward policy.
+Metrics are collected on the sender node only, alongside the memory and lock
+metrics.
+
+Cumulative socket counters are read once at `begin_point` and once at
+completion and reported as the completion-minus-baseline delta. The connection
+is long-lived and reused across points, so only the per-point delta is
+meaningful; the counters are not sampled every 100 milliseconds:
+
+- `send_octets`: bytes written to the distribution socket during the point,
+  from `inet:getstat(DistPort, [send_oct])`;
+- `send_count`: socket writes during the point, from
+  `inet:getstat(DistPort, [send_cnt])`. This is the primary native-versus-`ecall`
+  differentiator, because batching collapses many logical operations into one
+  top-level distribution signal;
+- `average_packet_bytes`: `send_octets / send_count`, or `0.0` when `send_count`
+  is zero.
+
+Instantaneous backpressure gauges are sampled on the same 100-millisecond loop
+as memory and reported as average and maximum. A delta of a gauge is
+meaningless, so gauges are sampled rather than differenced:
+
+- `send_pending`: bytes buffered in the port driver but not yet accepted by the
+  operating system socket, from `inet:getstat(DistPort, [send_pend])`;
+- `port_queue_size`: bytes in the distribution port output queue, from
+  `erlang:port_info(DistPort, queue_size)`;
+- `port_memory`: bytes held by the distribution port, from
+  `erlang:port_info(DistPort, memory)`.
+
+Distribution flow-control events are counted through an
+`erlang:system_monitor(Collector, [busy_dist_port])` monitor enabled at
+`begin_point` and restored to its previous value at completion. Each
+`{monitor, SusPid, busy_dist_port, Port}` message is one sender process
+suspended because the distribution port reached the busy limit:
+
+- `busy_dist_port_events`: total suspensions during the point;
+- `busy_dist_port_writers`: number of distinct suspended sender processes.
+
+Counting distinct writers retains a set of suspended process identifiers on the
+sender for the duration of the point, which marginally contributes to the
+measured sender memory. The collector keeps aggregates only; it does not retain
+the per-sample series.
 
 ## Result storage and reporting
 
@@ -533,7 +593,7 @@ The logged and stored result contains:
 - sanitized sender and receiver configuration;
 - elapsed monotonic time;
 - performance percentage relative to the configured per-writer pace;
-- sender memory and lock metrics.
+- sender memory, lock, and network metrics.
 
 The expected operations per second for one writer is `1000 / pace_ms`.
 `performance_percent` is the measured per-writer operations per second divided
@@ -553,13 +613,14 @@ log_private/
     send.ecall.tiny.10000.json
 ```
 
-The JSON object has `schema_version` set to `1` and otherwise preserves the
+The JSON object has `schema_version` set to `2` and otherwise preserves the
 result-map structure. Sender and receiver configurations are JSON strings.
 OTP's `json:encode/1` performs the encoding. The file is written directly to
 its final name; there is no temporary-file protocol. A reader can observe an
 incomplete file while the write is in progress. For compatibility, the parser
-also accepts existing schema-version-1 files without role configuration and
-the frontend presents their roles as `Unavailable`.
+also accepts existing schema-version-1 files without role configuration or
+network metrics; the frontend presents their missing roles as `Unavailable` and
+their missing network metrics as `N/A`.
 
 A JSON write error fails at the file operation. Failed performance points do
 not produce JSON. Their diagnosis remains in the standard Common Test report,
@@ -615,7 +676,18 @@ series. The reported trends cover:
 - maximum memory;
 - lock wait;
 - lock collision percentage;
-- lock duration percentage.
+- lock duration percentage;
+- distribution socket writes (`send_count`);
+- distribution bytes sent (`send_octets`);
+- average distribution packet size;
+- maximum distribution send-pending bytes;
+- maximum distribution port queue size;
+- maximum distribution port memory;
+- busy-dist-port suspensions;
+- distinct suspended writers.
+
+Network trends are absent for schema-version-1 points and are shown as gaps or
+`N/A`; they are never converted to zero.
 
 Average and maximum memory are stored as bytes but converted to decimal
 gigabytes (bytes divided by `1,000,000,000`) in both grids and charts.
@@ -663,7 +735,8 @@ The workload layer is complete when:
 - every successful call point validates the exact reply count;
 - participant or connection failure fails the point instead of producing a
   partial result;
-- every successful point contains sender memory and combined lock metrics;
+- every successful point contains sender memory, combined lock metrics, and
+  distribution channel network metrics;
 - every successful point is logged by `performance_metrics:point/2` and saved
   as one JSON file containing `distribution_busy_limit_kib` and sanitized
   sender and receiver configuration, without a password;

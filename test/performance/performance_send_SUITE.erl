@@ -164,7 +164,7 @@ run_send_point(Config) ->
   try
     ReceiverController = start_receiver_controller(Point),
     Receivers = await_receivers_started(Point, ReceiverController),
-    Metrics = performance_metrics:start(),
+    Metrics = performance_metrics:start(Point#point.receiver_node),
     try
       ok = performance_metrics:begin_point(Metrics),
       WriterController = start_writer_controller(Point, Receivers),

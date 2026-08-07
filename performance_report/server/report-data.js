@@ -30,7 +30,9 @@ function validatePoint(point) {
   requireValue(
     point !== null && typeof point === 'object' && !Array.isArray(point),
     'root');
-  requireValue(point.schema_version === 1, 'schema_version');
+  requireValue(
+    point.schema_version === 1 || point.schema_version === 2,
+    'schema_version');
   requireValue(operations.has(point.operation), 'operation');
   requireValue(paths.has(point.path), 'path');
   requireValue(
@@ -74,7 +76,41 @@ function validatePoint(point) {
     isFiniteNumber(locks?.duration_percent) &&
       locks.duration_percent >= 0,
     'metrics.locks.duration_percent');
+
+  if (point.schema_version >= 2) {
+    validateNetwork(point.metrics?.network);
+  }
   return point;
+}
+
+function validateNonNegativeNumber(value, field) {
+  requireValue(isFiniteNumber(value) && value >= 0, field);
+}
+
+function validateGauge(gauge, field) {
+  validateNonNegativeNumber(gauge?.average_bytes, `${field}.average_bytes`);
+  validateNonNegativeNumber(gauge?.maximum_bytes, `${field}.maximum_bytes`);
+}
+
+function validateNetwork(network) {
+  requireValue(
+    network !== null && typeof network === 'object' &&
+      !Array.isArray(network),
+    'metrics.network');
+  validateNonNegativeNumber(network.send_octets, 'metrics.network.send_octets');
+  validateNonNegativeNumber(network.send_count, 'metrics.network.send_count');
+  validateNonNegativeNumber(
+    network.average_packet_bytes,
+    'metrics.network.average_packet_bytes');
+  validateGauge(network.send_pending, 'metrics.network.send_pending');
+  validateGauge(network.port_queue_size, 'metrics.network.port_queue_size');
+  validateGauge(network.port_memory, 'metrics.network.port_memory');
+  validateNonNegativeNumber(
+    network.busy_dist_port_events,
+    'metrics.network.busy_dist_port_events');
+  validateNonNegativeNumber(
+    network.busy_dist_port_writers,
+    'metrics.network.busy_dist_port_writers');
 }
 
 async function pointFiles(directory) {

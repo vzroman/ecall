@@ -154,7 +154,7 @@ run_call_point(Config) ->
     State0 = start_participants(Point),
     try
       State1 = await_ready(State0),
-      Metrics = performance_metrics:start(),
+      Metrics = performance_metrics:start(Point#point.receiver_node),
       try
         ok = performance_metrics:begin_point(Metrics),
         StartedAt = erlang:monotonic_time(millisecond),
