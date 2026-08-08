@@ -3,6 +3,7 @@ import path from 'node:path';
 
 const operations = new Set(['send', 'cast', 'call']);
 const paths = new Set(['native', 'ecall']);
+const schemaVersions = new Set([1, 2, 3, 4, 5]);
 
 function requireValue(condition, field) {
   if (!condition) {
@@ -30,9 +31,7 @@ function validatePoint(point) {
   requireValue(
     point !== null && typeof point === 'object' && !Array.isArray(point),
     'root');
-  requireValue(
-    point.schema_version === 1 || point.schema_version === 2,
-    'schema_version');
+  requireValue(schemaVersions.has(point.schema_version), 'schema_version');
   requireValue(operations.has(point.operation), 'operation');
   requireValue(paths.has(point.path), 'path');
   requireValue(
@@ -58,9 +57,6 @@ function validatePoint(point) {
 
   const memory = point.metrics?.memory;
   requireValue(
-    isFiniteNumber(memory?.average_bytes) && memory.average_bytes >= 0,
-    'metrics.memory.average_bytes');
-  requireValue(
     isFiniteNumber(memory?.maximum_bytes) && memory.maximum_bytes >= 0,
     'metrics.memory.maximum_bytes');
 
@@ -72,13 +68,12 @@ function validatePoint(point) {
     isFiniteNumber(locks?.collision_percent) &&
       locks.collision_percent >= 0,
     'metrics.locks.collision_percent');
-  requireValue(
-    isFiniteNumber(locks?.duration_percent) &&
-      locks.duration_percent >= 0,
-    'metrics.locks.duration_percent');
 
   if (point.schema_version >= 2) {
     validateNetwork(point.metrics?.network);
+  }
+  if (point.schema_version >= 4) {
+    validateLoad(point.metrics?.load);
   }
   return point;
 }
@@ -87,30 +82,28 @@ function validateNonNegativeNumber(value, field) {
   requireValue(isFiniteNumber(value) && value >= 0, field);
 }
 
-function validateGauge(gauge, field) {
-  validateNonNegativeNumber(gauge?.average_bytes, `${field}.average_bytes`);
-  validateNonNegativeNumber(gauge?.maximum_bytes, `${field}.maximum_bytes`);
-}
-
 function validateNetwork(network) {
   requireValue(
     network !== null && typeof network === 'object' &&
       !Array.isArray(network),
     'metrics.network');
   validateNonNegativeNumber(network.send_octets, 'metrics.network.send_octets');
-  validateNonNegativeNumber(network.send_count, 'metrics.network.send_count');
   validateNonNegativeNumber(
     network.average_packet_bytes,
     'metrics.network.average_packet_bytes');
-  validateGauge(network.send_pending, 'metrics.network.send_pending');
-  validateGauge(network.port_queue_size, 'metrics.network.port_queue_size');
-  validateGauge(network.port_memory, 'metrics.network.port_memory');
+  validateNonNegativeNumber(
+    network.send_pending?.maximum_bytes,
+    'metrics.network.send_pending.maximum_bytes');
   validateNonNegativeNumber(
     network.busy_dist_port_events,
     'metrics.network.busy_dist_port_events');
-  validateNonNegativeNumber(
-    network.busy_dist_port_writers,
-    'metrics.network.busy_dist_port_writers');
+}
+
+function validateLoad(load) {
+  requireValue(
+    load !== null && typeof load === 'object' && !Array.isArray(load),
+    'metrics.load');
+  validateNonNegativeNumber(load.average_1m, 'metrics.load.average_1m');
 }
 
 async function pointFiles(directory) {

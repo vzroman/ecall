@@ -31,8 +31,8 @@ const metrics = [
   {id: 'net_throughput', label: 'Throughput', unit: 'MB/s', value: point => point.metrics?.network?.send_octets / (point.elapsed_ms / 1000) / 1_000_000},
   {id: 'net_packet', label: 'Avg packet', unit: 'B', value: point => point.metrics?.network?.average_packet_bytes},
   {id: 'net_send_pending', label: 'Max send pending', unit: 'MB', value: point => point.metrics?.network?.send_pending?.maximum_bytes / 1_000_000},
-  {id: 'net_queue', label: 'Max port queue', unit: 'MB', value: point => point.metrics?.network?.port_queue_size?.maximum_bytes / 1_000_000},
-  {id: 'net_busy_events', label: 'Busy-port suspensions', unit: '', value: point => point.metrics?.network?.busy_dist_port_events}
+  {id: 'net_busy_events', label: 'Busy-port suspensions', unit: '', value: point => point.metrics?.network?.busy_dist_port_events},
+  {id: 'load_1m', label: 'Load average', unit: '', value: point => point.metrics?.load?.average_1m}
 ];
 
 function configKey(point) {

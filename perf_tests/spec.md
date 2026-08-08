@@ -455,7 +455,7 @@ appropriate.
 
 ## Point metrics
 
-Every successful point collects memory, lock, and network metrics from the
+Every successful point collects memory, lock, network, and load metrics from the
 sender node.
 
 ### Collector lifecycle
@@ -471,8 +471,8 @@ The measured point follows this sequence:
    distribution socket counters, enable the busy-dist-port system monitor, and
    clear lock counters on the sender node.
 3. Record the point start time and release the writers.
-4. Every 100 milliseconds, sample total memory and the distribution channel
-   backpressure gauges.
+4. Every 100 milliseconds, sample total memory, the distribution send-pending
+   gauge, and the 1-minute load average.
 5. Stop collection when the point completion condition is met.
 6. Read the final distribution socket counters, restore the previous system
    monitor, collect the lock-counter results, and build the point result.
@@ -489,8 +489,8 @@ Each 100-millisecond sample reads:
 erlang:memory(total)
 ```
 
-The point result contains the average and maximum total memory in bytes. The
-tests do not read Linux `/proc` memory information.
+The point result contains the maximum total memory in bytes. The tests do not
+read Linux `/proc` memory information.
 
 ### Lock metrics
 
@@ -501,8 +501,8 @@ completion, it calls `lcnt:rt_collect/0`.
 The lock-counter mask is restricted to the distribution category, which is the
 narrowest category supported by OTP for this lock. The result retains only
 `dist_entry_out_queue` and combines all of its instances. No other locks are
-reported. The result contains accumulated wait time, collision percentage, and
-duration percentage. Lock counters are not sampled every 100 milliseconds.
+reported. The result contains accumulated wait time and collision percentage.
+Lock counters are not sampled every 100 milliseconds.
 
 ### Network metrics
 
@@ -526,37 +526,62 @@ meaningful; the counters are not sampled every 100 milliseconds:
 
 - `send_octets`: bytes written to the distribution socket during the point,
   from `inet:getstat(DistPort, [send_oct])`;
-- `send_count`: socket writes during the point, from
-  `inet:getstat(DistPort, [send_cnt])`. This is the primary native-versus-`ecall`
-  differentiator, because batching collapses many logical operations into one
-  top-level distribution signal;
-- `average_packet_bytes`: `send_octets / send_count`, or `0.0` when `send_count`
-  is zero.
+- `average_packet_bytes`: `send_octets` divided by the socket writes during the
+  point, from `inet:getstat(DistPort, [send_cnt])`, or `0.0` when there were no
+  writes. This is the primary native-versus-`ecall` differentiator, because
+  batching collapses many logical operations into one top-level distribution
+  signal, raising the average packet size. The write count itself is an
+  intermediate quantity and is not reported.
 
-Instantaneous backpressure gauges are sampled on the same 100-millisecond loop
-as memory and reported as average and maximum. A delta of a gauge is
-meaningless, so gauges are sampled rather than differenced:
+One instantaneous backpressure gauge is sampled on the same 100-millisecond loop
+as memory and reported as a maximum. A delta of a gauge is meaningless, so the
+gauge is sampled rather than differenced:
 
 - `send_pending`: bytes buffered in the port driver but not yet accepted by the
-  operating system socket, from `inet:getstat(DistPort, [send_pend])`;
-- `port_queue_size`: bytes in the distribution port output queue, from
-  `erlang:port_info(DistPort, queue_size)`;
-- `port_memory`: bytes held by the distribution port, from
-  `erlang:port_info(DistPort, memory)`.
+  operating system socket, from `inet:getstat(DistPort, [send_pend])`.
 
 Distribution flow-control events are counted through an
 `erlang:system_monitor(Collector, [busy_dist_port])` monitor enabled at
 `begin_point` and restored to its previous value at completion. Each
 `{monitor, SusPid, busy_dist_port, Port}` message is one sender process
-suspended because the distribution port reached the busy limit:
+suspended because the distribution port reached the busy limit, and
+`busy_dist_port_events` is the total number of such suspensions during the
+point. The suspended process identifiers are not retained, so counting costs
+nothing beyond the counter and does not contribute to the measured sender
+memory. The collector keeps aggregates only; it does not retain the per-sample
+series.
 
-- `busy_dist_port_events`: total suspensions during the point;
-- `busy_dist_port_writers`: number of distinct suspended sender processes.
+### Load metrics
 
-Counting distinct writers retains a set of suspended process identifiers on the
-sender for the duration of the point, which marginally contributes to the
-measured sender memory. The collector keeps aggregates only; it does not retain
-the per-sample series.
+Load metrics describe how heavily the operating system the sender node runs on is
+loaded. They are read from Linux `/proc/loadavg` on the sender only; the receiver
+host is not measured. The file is not namespaced by Linux, so a containerized
+sender reports the values of its host, including any work outside the container.
+The harness runs one sender container per host, so the reported values are
+dominated by the measured node.
+
+The file is read directly. The harness does not start `os_mon`, because `cpu_sup`
+would add an application and a port program to the peer node for a value that is
+one `file:read_file/1` away.
+
+Linux offers exactly three load-average intervals, 1, 5, and 15 minutes. The
+harness reports only the 1-minute figure, because the longer windows carry even
+less of the measured point. It is sampled on the same 100-millisecond loop as
+memory and reported as `average_1m`, the mean over the point. It is not read only
+once at completion; a completion-only reading would report whichever instant the
+point happened to end on rather than the point as a whole.
+
+The load average is an exponentially weighted moving average whose window is far
+longer than one point, and points run consecutively without a cooldown, so the
+value observed during a point still carries most of the preceding points. It is
+an indicator of accumulated background pressure rather than of the point itself,
+and it lags: a point cannot move it far, so consecutive points of different paths
+are not cleanly separated by it.
+
+The harness does not measure CPU utilization. A whole-host busy percentage
+normalized over all cores is not comparable with the per-core percentages `top`
+reports, saturates at 100 percent once the host is oversubscribed, and includes
+every other process on the host.
 
 ## Result storage and reporting
 
@@ -593,7 +618,7 @@ The logged and stored result contains:
 - sanitized sender and receiver configuration;
 - elapsed monotonic time;
 - performance percentage relative to the configured per-writer pace;
-- sender memory, lock, and network metrics.
+- sender memory, lock, network, and load metrics.
 
 The expected operations per second for one writer is `1000 / pace_ms`.
 `performance_percent` is the measured per-writer operations per second divided
@@ -613,14 +638,17 @@ log_private/
     send.ecall.tiny.10000.json
 ```
 
-The JSON object has `schema_version` set to `2` and otherwise preserves the
+The JSON object has `schema_version` set to `5` and otherwise preserves the
 result-map structure. Sender and receiver configurations are JSON strings.
 OTP's `json:encode/1` performs the encoding. The file is written directly to
 its final name; there is no temporary-file protocol. A reader can observe an
 incomplete file while the write is in progress. For compatibility, the parser
-also accepts existing schema-version-1 files without role configuration or
-network metrics; the frontend presents their missing roles as `Unavailable` and
-their missing network metrics as `N/A`.
+also accepts existing files of every earlier schema version: version 1 without
+role configuration, network metrics, or load metrics, and versions 2 and 3
+without load metrics. Earlier versions also carried metrics that are no longer
+produced, among them a version 3 CPU-utilization block; the parser requires only
+the metrics the report presents and ignores the rest wherever it appears. The
+frontend presents missing roles as `Unavailable` and missing metrics as `N/A`.
 
 A JSON write error fails at the file operation. Failed performance points do
 not produce JSON. Their diagnosis remains in the standard Common Test report,
@@ -678,16 +706,18 @@ series. The reported trends cover:
 - distribution throughput (`send_octets` divided by the elapsed seconds);
 - average distribution packet size;
 - maximum distribution send-pending bytes;
-- maximum distribution port queue size;
-- busy-dist-port suspensions.
+- busy-dist-port suspensions;
+- sender average 1-minute load average.
 
-The point result still records `send_count`, `send_octets`, `port_memory`, and
-`busy_dist_port_writers`; they are collected but not charted. Throughput is
-derived in the report from `send_octets` and the point `elapsed_ms`, and is
-reported in decimal megabytes per second.
+Every metric in the point result appears in the report, either as a trend of its
+own or as an input to a derived one; the harness does not collect metrics it does
+not present. Throughput is the one derived trend: the report computes it from
+`send_octets` and the point `elapsed_ms` and reports it in decimal megabytes per
+second.
 
-Network trends are absent for schema-version-1 points and are shown as gaps or
-`N/A`; they are never converted to zero.
+Network trends are absent for schema-version-1 points, and load trends are absent
+for schema versions 1 through 3. They are shown as gaps or `N/A`; they are never
+converted to zero.
 
 Maximum memory is stored as bytes but converted to decimal gigabytes (bytes
 divided by `1,000,000,000`) in both grids and charts.

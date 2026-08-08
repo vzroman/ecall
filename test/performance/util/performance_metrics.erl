@@ -13,7 +13,8 @@
 -define(TAG, ?MODULE).
 -define(SAMPLE_INTERVAL_MS, 100).
 -define(DISTRIBUTION_LOCK, dist_entry_out_queue).
--define(SCHEMA_VERSION, 2).
+-define(SCHEMA_VERSION, 5).
+-define(PROC_LOADAVG, "/proc/loadavg").
 
 -record(collector, {
   pid
@@ -26,20 +27,14 @@
   sample_ref,
   timer_ref,
   sample_count = 0,
-  memory_sum = 0,
   memory_max = 0,
   send_oct_base = 0,
   send_cnt_base = 0,
   send_oct_final = 0,
   send_cnt_final = 0,
-  send_pend_sum = 0,
   send_pend_max = 0,
-  queue_size_sum = 0,
-  queue_size_max = 0,
-  port_memory_sum = 0,
-  port_memory_max = 0,
   busy_events = 0,
-  busy_writers = #{}
+  load_sum = 0.0
 }).
 
 -opaque collector() :: #collector{}.
@@ -169,8 +164,8 @@ collector_loop(#state{sample_ref = SampleRef} = State) ->
       State1 = sample(State),
       TimerRef = schedule_sample(SampleRef),
       collector_loop(State1#state{timer_ref = TimerRef});
-    {monitor, SusPid, busy_dist_port, _Port} ->
-      collector_loop(record_busy(SusPid, State));
+    {monitor, _SusPid, busy_dist_port, _Port} ->
+      collector_loop(record_busy(State));
     {?TAG, Ref, From, finish} ->
       cancel_sample(State#state.timer_ref),
       State1 = sample(State),
@@ -196,41 +191,25 @@ cancel_sample(TimerRef) ->
 sample(#state{
     dist_port = DistPort,
     sample_count = SampleCount,
-    memory_sum = MemorySum,
     memory_max = MemoryMax,
-    send_pend_sum = SendPendSum,
     send_pend_max = SendPendMax,
-    queue_size_sum = QueueSizeSum,
-    queue_size_max = QueueSizeMax,
-    port_memory_sum = PortMemorySum,
-    port_memory_max = PortMemoryMax} = State) ->
+    load_sum = LoadSum} = State) ->
   Memory = erlang:memory(total),
   SendPend = socket_send_pend(DistPort),
-  QueueSize = port_queue_size(DistPort),
-  PortMemory = port_memory(DistPort),
+  Load = read_load_average(),
   State#state{
     sample_count = SampleCount + 1,
-    memory_sum = MemorySum + Memory,
     memory_max = erlang:max(MemoryMax, Memory),
-    send_pend_sum = SendPendSum + SendPend,
     send_pend_max = erlang:max(SendPendMax, SendPend),
-    queue_size_sum = QueueSizeSum + QueueSize,
-    queue_size_max = erlang:max(QueueSizeMax, QueueSize),
-    port_memory_sum = PortMemorySum + PortMemory,
-    port_memory_max = erlang:max(PortMemoryMax, PortMemory)
+    load_sum = LoadSum + Load
   }.
 
-result(#state{
-    sample_count = SampleCount,
-    memory_sum = MemorySum,
-    memory_max = MemoryMax} = State) ->
+result(#state{memory_max = MemoryMax} = State) ->
   #{
-    memory => #{
-      average_bytes => MemorySum / SampleCount,
-      maximum_bytes => MemoryMax
-    },
+    memory => #{maximum_bytes => MemoryMax},
     locks => lock_results(),
-    network => network_result(State)
+    network => network_result(State),
+    load => load_result(State)
   }.
 
 
@@ -257,17 +236,14 @@ finish_network(#state{dist_port = DistPort, prev_monitor = PrevMonitor} = State)
 
 drain_busy(State) ->
   receive
-    {monitor, SusPid, busy_dist_port, _Port} ->
-      drain_busy(record_busy(SusPid, State))
+    {monitor, _SusPid, busy_dist_port, _Port} ->
+      drain_busy(record_busy(State))
   after
     0 -> State
   end.
 
-record_busy(SusPid, #state{busy_events = Events, busy_writers = Writers} = State) ->
-  State#state{
-    busy_events = Events + 1,
-    busy_writers = Writers#{SusPid => []}
-  }.
+record_busy(#state{busy_events = Events} = State) ->
+  State#state{busy_events = Events + 1}.
 
 resolve_dist_port(ReceiverNode) ->
   {ReceiverNode, DistPort} =
@@ -283,48 +259,20 @@ socket_send_pend(DistPort) ->
   {ok, [{send_pend, SendPend}]} = inet:getstat(DistPort, [send_pend]),
   SendPend.
 
-port_queue_size(DistPort) ->
-  {queue_size, QueueSize} = erlang:port_info(DistPort, queue_size),
-  QueueSize.
-
-port_memory(DistPort) ->
-  {memory, Memory} = erlang:port_info(DistPort, memory),
-  Memory.
-
 network_result(#state{
-    sample_count = SampleCount,
     send_oct_base = SendOctBase,
     send_cnt_base = SendCntBase,
     send_oct_final = SendOctFinal,
     send_cnt_final = SendCntFinal,
-    send_pend_sum = SendPendSum,
     send_pend_max = SendPendMax,
-    queue_size_sum = QueueSizeSum,
-    queue_size_max = QueueSizeMax,
-    port_memory_sum = PortMemorySum,
-    port_memory_max = PortMemoryMax,
-    busy_events = BusyEvents,
-    busy_writers = BusyWriters}) ->
+    busy_events = BusyEvents}) ->
   SendOct = SendOctFinal - SendOctBase,
   SendCnt = SendCntFinal - SendCntBase,
   #{
     send_octets => SendOct,
-    send_count => SendCnt,
     average_packet_bytes => average_packet(SendOct, SendCnt),
-    send_pending => #{
-      average_bytes => SendPendSum / SampleCount,
-      maximum_bytes => SendPendMax
-    },
-    port_queue_size => #{
-      average_bytes => QueueSizeSum / SampleCount,
-      maximum_bytes => QueueSizeMax
-    },
-    port_memory => #{
-      average_bytes => PortMemorySum / SampleCount,
-      maximum_bytes => PortMemoryMax
-    },
-    busy_dist_port_events => BusyEvents,
-    busy_dist_port_writers => map_size(BusyWriters)
+    send_pending => #{maximum_bytes => SendPendMax},
+    busy_dist_port_events => BusyEvents
   }.
 
 average_packet(_SendOct, 0) ->
@@ -339,7 +287,6 @@ average_packet(SendOct, SendCnt) ->
 
 lock_results() ->
   Data = lcnt:rt_collect(),
-  DurationUs = time_us(proplists:get_value(duration, Data)),
   Locks = proplists:get_value(locks, Data),
   EntryLists =
     [Entries
@@ -350,7 +297,7 @@ lock_results() ->
       fun combine_lock_entry/2,
       empty_lock_stats(),
       lists:append(EntryLists)),
-  lock_result(Stats, DurationUs).
+  lock_result(Stats).
 
 combine_lock_entry(
     {{_File, _Line}, {Tries, Collisions, Wait}, _Histogram},
@@ -373,13 +320,10 @@ add_lock_stats(Left, Right) ->
     fun(Key, Value) -> Value + maps:get(Key, Right) end,
     Left).
 
-lock_result(
-    #{tries := Tries, collisions := Collisions, wait_us := WaitUs},
-    DurationUs) ->
+lock_result(#{tries := Tries, collisions := Collisions, wait_us := WaitUs}) ->
   #{
     collision_percent => percent(Collisions, Tries),
-    wait_us => WaitUs,
-    duration_percent => percent(WaitUs, DurationUs)
+    wait_us => WaitUs
   }.
 
 time_us({Seconds, Nanoseconds}) ->
@@ -391,3 +335,17 @@ percent(_Part, 0) ->
   0.0;
 percent(Part, Whole) ->
   (Part * 100) / Whole.
+
+
+%%====================================================================
+%% Load metrics
+%%====================================================================
+
+load_result(#state{sample_count = SampleCount, load_sum = LoadSum}) ->
+  #{average_1m => LoadSum / SampleCount}.
+
+read_load_average() ->
+  {ok, Data} = file:read_file(?PROC_LOADAVG),
+  [LoadAverage1m | _] =
+    binary:split(Data, [<<" ">>, <<"\n">>], [global, trim_all]),
+  binary_to_float(LoadAverage1m).
