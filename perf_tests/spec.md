@@ -468,14 +468,12 @@ The measured point follows this sequence:
 
 1. Start the sender metrics collector for the receiver node.
 2. Resolve the distribution channel to the receiver, read the baseline
-   distribution socket counters, enable the busy-dist-port system monitor, and
-   clear lock counters on the sender node.
+   distribution socket counters, and clear lock counters on the sender node.
 3. Record the point start time and release the writers.
-4. Every 100 milliseconds, sample total memory, the distribution send-pending
-   gauge, and the 1-minute load average.
+4. Every 100 milliseconds, sample total memory and the 1-minute load average.
 5. Stop collection when the point completion condition is met.
-6. Read the final distribution socket counters, restore the previous system
-   monitor, collect the lock-counter results, and build the point result.
+6. Read the final distribution socket counters, collect the lock-counter
+   results, and build the point result.
 
 The collector keeps aggregates only. It does not retain or log the complete
 sample series, and it does not report sampling-health metrics. There are no
@@ -509,7 +507,7 @@ Lock counters are not sampled every 100 milliseconds.
 Network metrics describe the single Erlang distribution channel from the sender
 to the receiver node. Native and `ecall` points share that one channel, so the
 metrics are directly comparable: batching should reduce the number of socket
-writes and busy-port suspensions, not the payload byte volume.
+writes, not the payload byte volume.
 
 The collector resolves the channel once, at `begin_point`, from
 `erlang:system_info(dist_ctrl)`, selecting the controlling entity for the
@@ -533,23 +531,17 @@ meaningful; the counters are not sampled every 100 milliseconds:
   signal, raising the average packet size. The write count itself is an
   intermediate quantity and is not reported.
 
-One instantaneous backpressure gauge is sampled on the same 100-millisecond loop
-as memory and reported as a maximum. A delta of a gauge is meaningless, so the
-gauge is sampled rather than differenced:
-
-- `send_pending`: bytes buffered in the port driver but not yet accepted by the
-  operating system socket, from `inet:getstat(DistPort, [send_pend])`.
-
-Distribution flow-control events are counted through an
-`erlang:system_monitor(Collector, [busy_dist_port])` monitor enabled at
-`begin_point` and restored to its previous value at completion. Each
-`{monitor, SusPid, busy_dist_port, Port}` message is one sender process
-suspended because the distribution port reached the busy limit, and
-`busy_dist_port_events` is the total number of such suspensions during the
-point. The suspended process identifiers are not retained, so counting costs
-nothing beyond the counter and does not contribute to the measured sender
-memory. The collector keeps aggregates only; it does not retain the per-sample
-series.
+These two deltas are the whole of the network result. The harness measures no
+distribution backpressure gauge, because neither of the two that OTP exposes on
+this path carries usable magnitude. The port-driver queue behind
+`inet:getstat(DistPort, [send_pend])` is clamped by the `inet` driver at its
+8-kilobyte busy watermark, so it saturates instead of scaling. Sender
+suspensions counted through `erlang:system_monitor(Collector, [busy_dist_port])`
+are governed by `distribution_busy_limit_kib`, which the harness sets high
+enough to take the limit out of the measurement; the count then reports how
+often that limit was nevertheless reached rather than how deep the backlog grew.
+The queue that does grow, the ERTS distribution output queue, has no BIF that
+exposes its size, and it is visible only as sender memory.
 
 ### Load metrics
 
@@ -638,7 +630,7 @@ log_private/
     send.ecall.tiny.10000.json
 ```
 
-The JSON object has `schema_version` set to `5` and otherwise preserves the
+The JSON object has `schema_version` set to `6` and otherwise preserves the
 result-map structure. Sender and receiver configurations are JSON strings.
 OTP's `json:encode/1` performs the encoding. The file is written directly to
 its final name; there is no temporary-file protocol. A reader can observe an
@@ -705,8 +697,6 @@ series. The reported trends cover:
 - lock collision percentage;
 - distribution throughput (`send_octets` divided by the elapsed seconds);
 - average distribution packet size;
-- maximum distribution send-pending bytes;
-- busy-dist-port suspensions;
 - sender average 1-minute load average.
 
 Every metric in the point result appears in the report, either as a trend of its

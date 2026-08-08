@@ -3,7 +3,7 @@ import path from 'node:path';
 
 const operations = new Set(['send', 'cast', 'call']);
 const paths = new Set(['native', 'ecall']);
-const schemaVersions = new Set([1, 2, 3, 4, 5]);
+const schemaVersions = new Set([1, 2, 3, 4, 5, 6]);
 
 function requireValue(condition, field) {
   if (!condition) {
@@ -91,12 +91,6 @@ function validateNetwork(network) {
   validateNonNegativeNumber(
     network.average_packet_bytes,
     'metrics.network.average_packet_bytes');
-  validateNonNegativeNumber(
-    network.send_pending?.maximum_bytes,
-    'metrics.network.send_pending.maximum_bytes');
-  validateNonNegativeNumber(
-    network.busy_dist_port_events,
-    'metrics.network.busy_dist_port_events');
 }
 
 function validateLoad(load) {

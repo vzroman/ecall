@@ -13,7 +13,7 @@
 -define(TAG, ?MODULE).
 -define(SAMPLE_INTERVAL_MS, 100).
 -define(DISTRIBUTION_LOCK, dist_entry_out_queue).
--define(SCHEMA_VERSION, 5).
+-define(SCHEMA_VERSION, 6).
 -define(PROC_LOADAVG, "/proc/loadavg").
 
 -record(collector, {
@@ -23,7 +23,6 @@
 -record(state, {
   receiver_node,
   dist_port,
-  prev_monitor,
   sample_ref,
   timer_ref,
   sample_count = 0,
@@ -32,8 +31,6 @@
   send_cnt_base = 0,
   send_oct_final = 0,
   send_cnt_final = 0,
-  send_pend_max = 0,
-  busy_events = 0,
   load_sum = 0.0
 }).
 
@@ -164,8 +161,6 @@ collector_loop(#state{sample_ref = SampleRef} = State) ->
       State1 = sample(State),
       TimerRef = schedule_sample(SampleRef),
       collector_loop(State1#state{timer_ref = TimerRef});
-    {monitor, _SusPid, busy_dist_port, _Port} ->
-      collector_loop(record_busy(State));
     {?TAG, Ref, From, finish} ->
       cancel_sample(State#state.timer_ref),
       State1 = sample(State),
@@ -189,18 +184,14 @@ cancel_sample(TimerRef) ->
 %%====================================================================
 
 sample(#state{
-    dist_port = DistPort,
     sample_count = SampleCount,
     memory_max = MemoryMax,
-    send_pend_max = SendPendMax,
     load_sum = LoadSum} = State) ->
   Memory = erlang:memory(total),
-  SendPend = socket_send_pend(DistPort),
   Load = read_load_average(),
   State#state{
     sample_count = SampleCount + 1,
     memory_max = erlang:max(MemoryMax, Memory),
-    send_pend_max = erlang:max(SendPendMax, SendPend),
     load_sum = LoadSum + Load
   }.
 
@@ -220,30 +211,15 @@ result(#state{memory_max = MemoryMax} = State) ->
 begin_network(#state{receiver_node = ReceiverNode} = State) ->
   DistPort = resolve_dist_port(ReceiverNode),
   {SendOct, SendCnt} = socket_counters(DistPort),
-  PrevMonitor = erlang:system_monitor(self(), [busy_dist_port]),
   State#state{
     dist_port = DistPort,
-    prev_monitor = PrevMonitor,
     send_oct_base = SendOct,
     send_cnt_base = SendCnt
   }.
 
-finish_network(#state{dist_port = DistPort, prev_monitor = PrevMonitor} = State) ->
+finish_network(#state{dist_port = DistPort} = State) ->
   {SendOct, SendCnt} = socket_counters(DistPort),
-  _ = erlang:system_monitor(PrevMonitor),
-  State1 = drain_busy(State),
-  State1#state{send_oct_final = SendOct, send_cnt_final = SendCnt}.
-
-drain_busy(State) ->
-  receive
-    {monitor, _SusPid, busy_dist_port, _Port} ->
-      drain_busy(record_busy(State))
-  after
-    0 -> State
-  end.
-
-record_busy(#state{busy_events = Events} = State) ->
-  State#state{busy_events = Events + 1}.
+  State#state{send_oct_final = SendOct, send_cnt_final = SendCnt}.
 
 resolve_dist_port(ReceiverNode) ->
   {ReceiverNode, DistPort} =
@@ -255,24 +231,16 @@ socket_counters(DistPort) ->
   {proplists:get_value(send_oct, Stats),
    proplists:get_value(send_cnt, Stats)}.
 
-socket_send_pend(DistPort) ->
-  {ok, [{send_pend, SendPend}]} = inet:getstat(DistPort, [send_pend]),
-  SendPend.
-
 network_result(#state{
     send_oct_base = SendOctBase,
     send_cnt_base = SendCntBase,
     send_oct_final = SendOctFinal,
-    send_cnt_final = SendCntFinal,
-    send_pend_max = SendPendMax,
-    busy_events = BusyEvents}) ->
+    send_cnt_final = SendCntFinal}) ->
   SendOct = SendOctFinal - SendOctBase,
   SendCnt = SendCntFinal - SendCntBase,
   #{
     send_octets => SendOct,
-    average_packet_bytes => average_packet(SendOct, SendCnt),
-    send_pending => #{maximum_bytes => SendPendMax},
-    busy_dist_port_events => BusyEvents
+    average_packet_bytes => average_packet(SendOct, SendCnt)
   }.
 
 average_packet(_SendOct, 0) ->

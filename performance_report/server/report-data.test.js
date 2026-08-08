@@ -9,8 +9,6 @@ function validNetwork(overrides = {}) {
   return {
     send_octets: 4096,
     average_packet_bytes: 512,
-    send_pending: {maximum_bytes: 200},
-    busy_dist_port_events: 3,
     ...overrides
   };
 }
@@ -31,7 +29,7 @@ function validMetrics(overrides = {}) {
 
 function validPoint(overrides = {}) {
   return {
-    schema_version: 5,
+    schema_version: 6,
     operation: 'send',
     path: 'native',
     payload: 'tiny',
@@ -182,15 +180,15 @@ test('rejects schema-version-2 points with invalid network metrics', async () =>
       path.join(dataDirectory, 'missing-network.json'),
       JSON.stringify(schemaTwoPoint({metrics: withoutNetwork})));
     await writeFile(
-      path.join(dataDirectory, 'bad-gauge.json'),
+      path.join(dataDirectory, 'bad-octets.json'),
       JSON.stringify(schemaTwoPoint({
-        metrics: validMetrics({network: validNetwork({send_pending: {}})})
+        metrics: validMetrics({network: validNetwork({send_octets: -1})})
       })));
     await writeFile(
-      path.join(dataDirectory, 'bad-events.json'),
+      path.join(dataDirectory, 'bad-packet.json'),
       JSON.stringify(schemaTwoPoint({
         metrics: validMetrics({
-          network: validNetwork({busy_dist_port_events: -1})
+          network: validNetwork({average_packet_bytes: '512'})
         })
       })));
 
@@ -201,15 +199,15 @@ test('rejects schema-version-2 points with invalid network metrics', async () =>
     assert.ok(result.runs[0].errors.some(
       error => error.message.endsWith('metrics.network')));
     assert.ok(result.runs[0].errors.some(
-      error => error.message.endsWith('metrics.network.send_pending.maximum_bytes')));
+      error => error.message.endsWith('metrics.network.send_octets')));
     assert.ok(result.runs[0].errors.some(
-      error => error.message.endsWith('metrics.network.busy_dist_port_events')));
+      error => error.message.endsWith('metrics.network.average_packet_bytes')));
   } finally {
     await rm(temporaryRoot, {recursive: true, force: true});
   }
 });
 
-test('rejects schema-version-5 points with invalid load metrics', async () => {
+test('rejects schema-version-6 points with invalid load metrics', async () => {
   const temporaryRoot = await mkdtemp(
     path.join(os.tmpdir(), 'ecall-performance-report-load-'));
   try {
