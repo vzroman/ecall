@@ -1,0 +1,28 @@
+The task is to prepare an article intenden for publishing on:
+* dev.to
+* Hashnode
+* Medium
+* forums.erlang.org
+* elixirforum.com
+* Erlang Solutions Blog
+* Hacker News (news.ycombinator.com) & Lobsters (lobste.rs)
+* linkedin
+The list is preliminary.
+
+We go step by step:
+-----------phase 1----------------------
+You learn carefully:
+* perf_tests/findings.md
+* the project's source code
+* performance tests source code under test/performance
+* tests results under /home/roman/WORKTEMP/202608/ecall/good_samples
+------------phase 2----------------------------
+You synthesize all together and prepare conclusions. You save them in perf_tests/main_conclusions.md. Then you agree with me each in a step in an interview mode (brainstorming). On our way you add/edit/delete them and mark as agreed.
+-----------phase 3------------------------------
+You do a thorough web research. The goal is to find examples of articles that can be helpful for our article like style, level of detalization, flow etc. You save the links and main findings for each in perf_tests/reasearch.md 
+-----------phase 4---------------------------------
+You prepare the article's structure. What blocks should it have. The main idea for each block. What screenshots/test results we can use etc. The flow you present and agree with me the structure. Then you agree with me each block step by step (not all at once). The structure may transform on our way. It's an interractive brainstorming phase. On our way you save agreed structure and blocks in perf_tests/article_structure.md. Additionally you save the log of our conversation in perf_tests/discussion.md (it's supposed to be used to restore the phase context if the work is interrupted and continued in another session)
+---------phase 5-------------------------------------
+implemantion
+----------phase 6-------------------------------------
+review
