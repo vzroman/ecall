@@ -1064,7 +1064,50 @@ Status: `PROPOSED`
 
 ---
 
-## 19. ⚠️ We cannot currently explain where the 37 GB goes — and must not pretend we can
+## 19. ✅ ANSWERED — the memory is `binary`: ERTS distribution output buffers, and `+zdbbl` does not bound it
+
+**Resolved 2026-08-13** by retaining the full `erlang:memory()` breakdown at
+100 ms. The section below is kept for the record; the answer is here.
+
+| point | peak `total` | peak **`binary`** | peak `processes` |
+|---|---:|---:|---:|
+| native `BL1024` `data` 120k | 34.26 GB | **31.61 GB** | 2.13 GB |
+| native `BL1024` `tiny` 120k | 26.66 GB | **24.04 GB** | 2.10 GB |
+| native `BLMAX` `data` 120k | 36.17 GB | **33.54 GB** | 2.03 GB |
+| **ecall** `BL1024` `data` 120k | 3.06 GB | **0.05 GB** | 2.40 GB |
+
+Three clean facts:
+
+1. **It is all `binary`.** The `data` payload contains no binaries whatsoever —
+   it is a map of atoms. So this is ERTS's own **distribution output buffers**,
+   which are allocated from the binary allocator. Not user data, not message
+   queues, not process heaps.
+2. **`processes` never grows.** Flat at ~2.1 GB in every native configuration.
+   (An earlier reading of "22 GB in processes" came from the 11-sample starved
+   run and was an artifact — see conclusion 24.)
+3. **`+zdbbl` does not bound it.** Peak `binary` reaches **31.6 GB against a
+   configured busy limit of 1 MiB**, and 33.5 GB against a 2.15 GB limit
+   (15.6×). Whatever `qsize` accounts for, it is *not* the memory the
+   distribution path actually holds.
+
+Fact 3 is a genuinely useful, non-obvious, actionable claim: **operators raise
+`+zdbbl` believing it caps buffering, and it does not.** It complements
+MacMullen's 2013 observation that raising it does not buy throughput either.
+
+**The pooled path simply does not have this problem** — 0.05 GB of binary
+against native's 31.6 GB, a 600× difference, because it never asks the
+distribution path to hold 120 million individually-encoded signals.
+
+**What we should still not claim:** the precise reason peak `binary` exceeds
+the total wire bytes of the whole workload (27 GB). Encoded output buffers are
+allocated against an upper-bound size estimate before the atom cache shrinks
+the actual encoding, and binary-allocator carriers are released lazily — either
+would explain it. We have not separated them. Report the measurement; do not
+explain the excess.
+
+---
+
+## 19-old. (superseded) We cannot currently explain where the 37 GB goes
 
 Working through the arithmetic while writing conclusion 18 exposed a hole in
 conclusion 8.
@@ -1341,7 +1384,275 @@ out of it; the pooled path does not.* Roughly 25 minutes of machine time
 Cost: one small harness change (retain the series), no change to the measured
 paths. Risk: low — it is instrumentation only.
 
-Status: `PROPOSED — needs Roman's go-ahead to capture`
+### 22a. ✅ CAPTURED — the saw is real, and remarkably regular
+
+Native @ `BLMAX`, `data`, 120k writers, 3,929 samples at 100 ms. Binary memory:
+
+| peak | trough | amplitude | period |
+|---:|---:|---:|---:|
+| 7.83 GB | 2.41 GB | 5.42 GB | — |
+| 9.80 GB | 4.54 GB | 5.26 GB | 34 s |
+| 12.40 GB | 7.09 GB | 5.31 GB | 32 s |
+| … 13 cycles … | | | |
+| 31.65 GB | 26.30 GB | 5.35 GB | 33 s |
+
+**Period 33 s ± 1 s. Amplitude 5.3 GB ± 0.1 GB.** Thirteen clean cycles riding
+a linear ramp from 0 to 33.5 GB. Roman's field observation confirmed with
+precision.
+
+**Roman's refinement (2026-08-13):** *"the saw is mainly not about memory but
+about load average and CPU consumption (the writers wait)."* The memory
+sawtooth is the visible proxy; the thing that actually oscillates is the
+**writer population's ability to run**. Being captured now with `cpu_util`,
+`sched_util`, `run_queue` and `load` at 100 ms alongside memory.
+
+**Also confirmed: the socket is not the constraint.** `send_pend` on the native
+path sits at **8,415 bytes max, 7,918 mean** — pinned at the `inet` driver's
+8 KB busy watermark exactly as `spec.md` predicted, while the pooled path
+reaches 129 KB because it writes bigger blocks. The port queue is clamped; the
+backlog is upstream of it, in the distribution output queue.
+
+Status: `PARTIALLY CAPTURED — memory saw confirmed; CPU/load capture in flight`
+
+---
+
+## 23. Pool sizing — 24 beats 64, and the pool has its own knee
+
+Measured 2026-08-13, `BL1024`, 120k writers, `ecall` path, all other settings
+identical. Pool size applied via `application:set_env(ecall, pool_size, N)` on
+both nodes before `ecall` starts.
+
+### `data` payload, 120k writers
+
+| pool | perf % | lock wait | collisions | avg packet | peak mem |
+|---:|---:|---:|---:|---:|---:|
+| **1** | 54.4 | **0 s** | **0.0 %** | 53,937 B | 13.83 GB |
+| **24** | **99.0** | 18 s | 46.2 % | 2,899 B | 3.02 GB |
+| 64 (this run) | 90.6 | 156 s | 83.0 % | 2,604 B | 3.06 GB |
+| 64 (Aug baseline) | 96.0 | 98 s | 75.6 % | 2,689 B | 3.05 GB |
+
+`tiny`, 120k: pool 1 → 61.9 %, pool 24 → **98.3 %**, pool 64 → 95.4 %.
+
+### The pool has its own knee, and its position moves with pool size
+
+Performance across writer counts, `BL1024`:
+
+| writers | native | pool 1 | pool 24 |
+|---:|---:|---:|---:|
+| 20,000 | 99.1 | 98.7 | 99.1 |
+| 40,000 | 60.8 | 99.1 | 97.9 |
+| 80,000 | 25.1 | 70.3 | 93.3 |
+| 120,000 | 16.5 | 54.4 | 99.0 |
+
+- **native** (120,000 direct writers): knee at 20–30k
+- **pool 1**: knee at 40–80k
+- **pool 24**: no knee within the tested range
+
+So the funnel does not merely *shift* the collapse — the pool width sets where
+it lands, and 24 pushes it beyond anything we tested.
+
+### Why 24 beats 64
+
+Fewer writers on `qlock` → lower collision rate (46 % vs 83 %) → the lock stays
+below its contention threshold → each proxy waits longer between successful
+sends → **bigger batches** (2,899 B vs 2,604 B) → fewer signals still. The same
+virtuous cycle as 10a, now driven by pool width instead of by the busy limit.
+Both levers feed the same mechanism.
+
+### ⚠️ CORRECTION — "24 beats 64" does not survive replication
+
+I wrote that confidently off one run. Repeating it with process-lock counting
+enabled gives the opposite ordering:
+
+| pool | `data` 120k, run P | run L |
+|---:|---:|---:|
+| 24 | 99.0 % | 93.7 % |
+| 64 | 90.6 % (M1) / 96.0 % (Aug) / 99.0 % (L) | 99.0 % |
+
+**Pool 24 and pool 64 are indistinguishable within run-to-run variance.** Both
+are decisively better than pool 1. Do not publish a "24 is optimal" claim.
+
+**What IS systematic — and is the better finding.** Pool width moves contention
+from one lock to another, monotonically. `tiny`, 120k, cumulative wait:
+
+| pool | proxy mailbox (`proc_msgq` + `proc_sig_queue_buffer`) | `dist_entry_out_queue` |
+|---:|---:|---:|
+| 1 | **299.0 s** | 0.0 s |
+| 24 | 37.8 s | 81.7 s |
+| 64 | 13.9 s | **344.7 s** |
+
+Mailbox contention falls 21× as the pool widens; distribution-queue contention
+rises without bound. **There is an optimum, and it is the crossover between two
+opposing curves** — but our single runs cannot locate it, and on this hardware
+the throughput plateau between 24 and 64 is wide enough that it does not matter
+much in practice.
+
+**Honest recommendation for the article:** present the trade-off curve, not a
+magic number. Say that the pool must be large enough to escape mailbox
+contention and small enough to keep the distribution queue below its threshold,
+that anything in the tens works on a 48-core box, and that pool 1 is the
+failure mode.
+
+### ✅ Pool 1 — Roman's hypothesis confirmed: it is the proxy's mailbox lock
+
+`tiny`, 120k writers, pool 1, `lcnt` mask `[distribution, process]`:
+
+| lock | wait | tries | collisions |
+|---|---:|---:|---:|
+| **`proc_msgq`** | **286.3 s** | 7,217,991 | **81.4 %** |
+| `proc_sig_queue_buffer` | 12.7 s | 135,267,781 | 4.1 % |
+| `pix_lock` | 11.7 s | 212,042 | 9.7 % |
+| `dist_entry_out_queue` | **0.0 s** | 1,108,306 | 0.9 % |
+
+The distribution lock is *silent* — one proxy cannot contend with itself — and
+286 seconds of contention has appeared on the single proxy's message queue.
+**That is exactly the prediction.**
+
+**And it shows the OTP 25 optimisation working, then being overwhelmed.**
+`proc_sig_queue_buffer` took **135 million** acquisitions at only 4.1 %
+collisions — the 64 signal-queue buffers absorbed the bulk of the fan-in
+(conclusion 17). But every buffer flush still needs `proc_msgq`, and those
+7.2 million flushes collided 81 % of the time. The shard mitigates; it does not
+eliminate.
+
+**Payload-dependent, and worth noting honestly.** For `data` at pool 1 the
+locks are quiet (`proc_sig_queue_buffer` 8.9 s over exactly 120,021,839 tries —
+one per message — and `proc_msgq` only 2.3 s), yet throughput is still 43 %. So
+`data` at pool 1 is limited by **single-process throughput**, not lock
+contention: one proxy receiving 1.2M msg/s and one remote worker dispatching
+them. Two different bottlenecks behind the same symptom.
+
+**Caveat:** enabling process-lock counting costs real throughput (pool 1 `data`
+measured 54.4 % without it, 43.4 % with). The L-series numbers are internally
+comparable but must not be compared against the P-series or the baseline.
+
+### Pool 1 — superseded analysis
+
+At pool 1 the distribution lock is essentially uncontended: **0 s wait, 0.0 %
+collisions** — one proxy cannot contend with itself — yet throughput still
+collapses to 54 %. So the bottleneck moved somewhere the `[distribution]` lock
+mask cannot see. Two candidates, which pool 1 unfortunately conflates:
+
+1. **The single proxy's message-queue lock** — 120,000 writers sending to one
+   process (Roman's hypothesis).
+2. **The single remote worker** — one process decoding every batch and
+   performing every local send, a pure serial-consumer ceiling.
+
+Note also the batch sizes at pool 1 are enormous — 53,937 B, roughly 315
+messages per signal — which is exactly what conclusion 6 predicts when the
+consumer is saturated. **Being resolved by the `[distribution, process]`
+lock-category run (in progress).**
+
+Status: `PROPOSED — pool-width result solid; pool-1 mechanism pending`
+
+---
+
+## 24. The measurement that measured itself: a 100 ms timer that fired 11 times in 10 minutes
+
+The metrics collector is an ordinary Erlang process on the sender, waking on
+`erlang:send_after(100, …)`. How often it actually woke is itself a result:
+
+| run | samples | of expected | max gap |
+|---|---:|---:|---:|
+| `ecall` `BL1024` `data` 120k | 1,004 | 89.6 % | 10.2 s |
+| native `BLMAX` `data` 120k | 3,929 | 75.1 % | 7.4 s |
+| **native `BL1024` `data` 120k** | **11** | **0.2 %** | **485.7 s** |
+
+On the **default** busy limit, a 100 ms timer fired **eleven times in 609
+seconds**, with a single gap of over **eight minutes**. Timers are serviced by
+scheduler threads; when the schedulers are parked in a futex on `qlock` and
+grinding through O(N) resume herds, ordinary Erlang work simply does not run.
+
+This is the "whole VM degrades" claim measured directly — and it is a far
+better demonstration than any lock counter, because it needs no ERTS knowledge
+to understand. **The node was not slow. For minutes at a time it was not
+running Erlang at all.**
+
+Raising the collector to `priority, max` recovered it to **43 %** (2,527 of
+5,890 samples) — better, but still more than half the ticks lost.
+
+### Two consequences
+
+1. **It explains the one irreproducible metric.** `memory_max` on native
+   `BL1024` was a maximum over ~11 samples of a 5 GB-amplitude sawtooth —
+   effectively a random draw. That is exactly why `data` 120k read 37.4 GB in
+   August and 47.3 GB in the replication while throughput and lock wait
+   reproduced to 0.1 %. It also means the **`load.average_1m` figures in every
+   native `BL1024` point are means over ~11 samples** and should not be quoted
+   at all (reinforcing 12.8 and D-drop of the load metric).
+2. **It is a methodological warning worth publishing.** In-VM sampling on a
+   node that is itself the subject of a saturation experiment is not
+   trustworthy without checking that the sampler ran. We only discovered this
+   because we started retaining the sample series. Any BEAM benchmark that
+   reports in-VM gauges under saturation without reporting sampler health is
+   suspect — including, until three days ago, ours.
+
+Status: `PROPOSED — strong candidate for the article's most memorable number`
+
+---
+
+## 25. ✅ The saw is a CPU/run-queue phenomenon — and the two busy limits are two different diseases
+
+Roman was right that the saw is "mainly not about memory but about load average
+and CPU consumption (the writers wait)". Captured at 100 ms with `cpu_util`
+(`/proc/stat`), `sched_util` (`scheduler_wall_time`), `run_queue` and memory.
+`data`, 120k writers:
+
+| | native `BL1024` (default) | native `BLMAX` | **`ecall` `BL1024`** |
+|---|---:|---:|---:|
+| elapsed | 542 s | 492 s | **109 s** |
+| OS CPU, mean | **73 %** (93 % while active) | **13.3 %** | 38.3 % |
+| scheduler utilisation | **50.1 %**, pinned | 5.0 % (bursts to 50 %) | 15.3 % |
+| run queue, mean | **67,140** (max 99,558) | **1** (bursts to 75,195) | **81** |
+| `binary`, shape | **21.6 GB, flat** | 0 → 33.5 GB, sawing | **0.02 GB** |
+| sampler health | 21 % of ticks | 75 % | 92 % |
+
+### These are two qualitatively different failure modes, not one
+
+**At the default 1 MiB limit there is no saw at all.** The suspend/resume cycle
+runs at ~23 ms and averages into a *permanently saturated* state: ~88,000
+processes runnable at every single sample, 93 % CPU, scheduler utilisation
+pinned at exactly 50.1 % for the entire point.
+
+**At the huge limit the oscillation becomes visible** because its period
+stretches to ~33 s: the node sits at **5 % CPU with a run queue of 1** — every
+writer suspended — then all 120,000 become runnable at once, the run queue
+jumps to 35,000–75,000, CPU spikes to 94 %, the queue refills, and everyone
+suspends again. **The thundering herd, directly visible in the run queue.**
+
+So Roman's expectation that "at 1024 the behaviour is the same but harder to
+distinguish" needs one refinement: at 1024 it is not a faster saw, it is a
+*collapsed* saw — the oscillation is fast enough that the system never leaves
+the saturated state.
+
+### 🔑 The default busy limit costs 5.5× the CPU for the same throughput
+
+`BL1024` 73 % mean CPU vs `BLMAX` 13.3 %, for 16.5 % vs 20.2 % throughput and
+542 s vs 492 s elapsed. **Same work, same wall clock, five and a half times the
+CPU.** That is a new and separable cost of the low limit — not throughput, not
+memory, but burned cores — and it is what the load-average saw was showing.
+
+This sharpens conclusion 9: raising `+zdbbl` on the *native* path does not fix
+throughput, but it does dramatically reduce the CPU wasted on suspend/resume
+churn. It buys efficiency, not speed. (For the *pooled* path the calculus is
+different — see 10a.)
+
+### The 43-point gap between CPU and useful work
+
+At `BL1024` the OS reports **93 %** CPU while BEAM's own scheduler accounting
+reports **50.1 %** active. Roughly 45 of 48 cores are busy; about 24 cores'
+worth is doing anything. **~21 cores burned on nothing** — spinning on locks
+and processing resume herds. This is the concrete form of the *Erlang in Anger*
+warning that OS CPU% overstates real BEAM work, and it is why
+`scheduler_wall_time` is the metric to quote.
+
+### The single most quotable comparison
+
+**Run queue: 88,000 versus 81.** Same workload, same hardware, same socket. The
+native path keeps eighty-eight thousand processes permanently runnable and
+never gets them served; the pooled path keeps eighty-one.
+
+Status: `PROPOSED — the strongest figure set in the whole study`
 
 ---
 
