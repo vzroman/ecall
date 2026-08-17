@@ -28,7 +28,7 @@ init_pool()->
 
   register( ?MODULE, self() ),
 
-  PoolSize = application:get_env(ecall, pool_size, ?POOL_SIZE),
+  PoolSize = pool_size(),
 
   Workers =
     [ spawn_opt(fun()-> worker_loop(#state{}) end,
@@ -38,6 +38,20 @@ init_pool()->
   pg:join(?pg_scope, ?pg_group, self() ),
 
   master_loop( Workers ).
+
+pool_size()->
+  case application:get_env(ecall, pool_size) of
+    {ok, PoolSize} when is_integer(PoolSize)->
+      PoolSize;
+    _->
+      Cores = erlang:system_info(logical_processors),
+      if
+        Cores >= 2 -> Cores div 2;
+        true -> 1
+      end
+  end.     
+
+
 
 master_loop( Workers )->
   receive
