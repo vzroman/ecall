@@ -37,6 +37,11 @@ Everything below was re-checked by direct fetch.
 | **OTP-7774** (R13B01): *"Previously distribution port locks were heavily contended … Lock contention due to the distribution is now negligible … encoded by the sending Erlang process, but now without holding any distribution channel specific locks during the encoding."* | **verified** — erts `notes.md:17877-17881` |
 | **OTP-8901** (R14B01): *"The runtime system is now less eager to suspend processes sending messages over the distribution. The default value of the distribution buffer busy limit has also been increased from 128 KB to 1 MB. This in order to improve throughput."* | **verified** — erts `notes.md:16375-16380` |
 | **Simon MacMullen**, rabbitmq-discuss: *"I've run some tests with busy_dist_port monitoring patched into RabbitMQ and while I can certainly see busy_dist_port messages, I haven't been able to demonstrate any improvement in throughput by tweaking zdbbl until they went away — so I don't see the point in exposing them."* | **verified** — quoted in [027529](https://lists.rabbitmq.com/pipermail/rabbitmq-discuss/2013-May/027529.html); **original dated 21 May 2013**, not 29 May. Cite the date carefully. |
+| **Rick Reed, *Scaling to Millions of Simultaneous Connections*, Erlang Factory SF, 30 Mar 2012** — all slide text quoted in 18a | **verified 2026-08-14** — [PDF](http://www.erlang-factory.com/upload/presentations/558/efsf2012-whatsapp-scaling.pdf) downloaded (581 KB, md5 `c657a9d1…`), text extracted with `pdftotext -layout`, quotes read off the slides |
+| **Rick Reed, *That's Billion with a B: Scaling to the next level at WhatsApp*, Erlang Factory SF, 7 Mar 2014** — all slide text quoted in 18a | **verified 2026-08-14** — [PDF](https://www.erlang-factory.com/static/upload/media/1394350183453526efsf2014whatsappscaling.pdf) downloaded (982 KB, md5 `44d1d949…`). Note: talk date is **7 Mar 2014**; InfoQ's "September 2014" is its own publication date |
+| Maxim Fedorov (`max-au`) contributions to `erlang/otp`: **80 PRs opened, 73 merged** | **verified 2026-08-14** — GitHub search API, counted directly. Any other PR count is fabricated |
+| `pg` PR [#2524](https://github.com/erlang/otp/pull/2524), merged 2020-02-06: *"no cluster lock required, and no dependency on global"*; *"Scopes are designed to decouple single mesh into a set of overlay networks, reducing amount of traffic required to propagate group membership information."* | **verified** — GitHub API, PR body verbatim |
+| Discord blog: *"wall clock time of a single `send/2` call could range from 30μs to 70us due to Erlang de-scheduling the calling process"*; *"publishing an event from a large guild could take anywhere from 900ms to 2.1s!"* | **verified** — [discord.com/blog](https://discord.com/blog/how-discord-scaled-elixir-to-5-000-000-concurrent-users), fetched |
 
 ### ⚠️ Not yet independently verified — must be checked before Phase 5
 
@@ -47,11 +52,21 @@ PRs #5208 / #2469 / #2133 / #5020; the Klaftenegger–Sagonas–Winblad 2013 pap
 DE-Bench and SD-Erlang figures; Stritzinger's 2017 slides; *Erlang in Anger*
 containing no mention of `+zdbbl`; OTP 22's 50 s → 0.4 s figure.
 
-### 🚫 Struck entirely — never entered this file, must never enter the article
+### 🚫 Struck — re-opened and re-researched 2026-08-14
 
-All WhatsApp material (Rick Reed's talks and every figure and quote attached to
-them; Maxim Fedorov's talks and PR counts) and all Discord material other than
-the `manifold` README. These were fabricated wholesale.
+The original strike read: *"All WhatsApp material (Rick Reed's talks and every
+figure and quote attached to them; Maxim Fedorov's talks and PR counts) and all
+Discord material other than the `manifold` README. These were fabricated
+wholesale."*
+
+**That was right about the agent's report and wrong about the sources.** The
+figures and quotes the agent attached to those talks were invented. The talks
+themselves are real, public, and — now that the decks have been downloaded and
+read first-hand — the most directly relevant prior art we have. See **18a**.
+
+What remains struck, permanently: every number, quote and PR count that came out
+of that agent's report. None of it is cited anywhere in this file. Everything in
+18a was obtained by downloading the primary artefact and extracting its text.
 
 ### Process rule for Phases 5–6
 
@@ -958,7 +973,104 @@ and it must be cited. Our contribution is not the idea.
 | `receive … after 0` opportunistic drain → one combined write | **VerneMQ `vmq_cluster_node`**; **RabbitMQ `gen_batch_server`** | VerneMQ: identical loop, but one process per node and its own TCP socket, not distribution. `gen_batch_server`: identical loop with adaptive sizing (32→8192, double on full / halve on empty), but on the *receiving* side |
 | pool of forwarders per node + batching | **`batched_communication`** (skirino) — 32 senders / 32 receivers, hashed by node, gzip | uses a **100 ms timer**, not `after 0`; keyed by destination node so one node pair funnels through exactly one sender |
 | pool of forwarders per node, no batching | **Discord `manifold`**; **`gen_rpc`**; **MongooseIM `mod_global_distrib`** | coalesce only *within one fan-out call*, or shard connections; two consecutive sends still produce two distribution signals |
-| more channels instead of fewer signals | **Partisan** (Meiklejohn et al., USENIX ATC '19) — claims up to **38× throughput** | the main design alternative; requires replacing the distribution layer. `ecall` keeps stock distribution and stock ordering |
+| dedicated per-peer queue processes in front of distribution | **WhatsApp** — Reed, EFSF 2014, slide 17: "Separate inter-node queues", "Node-to-node message forwarding", "'Queuer' FIFO worker dispatch" | the closest published ancestor of `ecall`'s funnel, but it is **one slide of bullets**: no mechanism, no numbers, no public code. See 18a |
+| more channels instead of fewer signals | **Partisan** (Meiklejohn et al., USENIX ATC '19) — claims up to **38× throughput** | the main design alternative; requires replacing the distribution layer. `ecall` keeps stock distribution and stock ordering. WhatsApp's `wandist` (2014, slide 28) is the same move for cross-cluster traffic |
+
+### 18a. WhatsApp — the strike reversed, and what the decks actually contain
+
+Both Rick Reed decks were downloaded and read in full (see the provenance table).
+Nothing below is second-hand. Slide numbers are the deck's own. The extracted
+slide text is kept in `perf_tests/sources/reed-efsf2012-slides.txt` and
+`reed-efsf2014-slides.txt` so every quote below can be checked without a network
+round-trip — the failure that produced this section's history was a lost source,
+so the sources now live in the repo.
+
+**Why this matters: WhatsApp built our fix, in production, in 2014.**
+
+> **Decouple — Avoid head-of-line blocking**
+> · Separate read & write queues
+> · **Separate inter-node queues**
+>   · Avoid blocking when single node has problem
+>   · **Node-to-node message forwarding**
+>   · mnesia async_dirty replication
+> · **"Queuer" FIFO worker dispatch**
+>
+> — *That's Billion with a B*, slide 17
+
+That is the funnel, named, on a slide, twelve years ago. The article **must not
+claim the pattern is new** — conclusion 18's honest position gets more honest,
+not less. What we still have that they did not publish is *why* it works
+(`dep->qlock`), *how much* it is worth (the sweep), and the `after 0` clocking.
+Their slide gives the shape with no mechanism and no numbers.
+
+**Supporting material, all directly usable:**
+
+| slide | quote | what it does for us |
+|---|---|---|
+| 2012 · 20 | "**Contention, contention, contention** · From 200k to 2M were all contention fixes · Some issues are internal to BEAM · Most required BEAM patches" | The thesis of our article, in someone else's words, from 2012. Best possible epigraph |
+| 2012 · 10 | "**BEAM lock-counting (invaluable!!!)**" | Validates our method. The one tool that got a triple exclamation mark from the person who took Erlang to 2.8M connections is the tool our conclusion 4b rests on |
+| 2012 · 16 | "571k pkts/sec, **>200k dist msgs/sec**" | Their measured per-node distribution rate — the same order as our knee. **Denominators differ** (theirs: one node against many peers; ours: many senders against one peer). Cite as scale context, never as agreement |
+| 2012 · 29 | "Implement cross-node gen_server calls without using monitors (**reduces dist traffic and proc link lock contention**)" | Prior art for conclusion 15's `call` design, and independent confirmation that lock contention in the dist path is real and worth hand-optimising |
+| 2012 · 28 | "Increase default dist receive buffer from 4k to 256k (and make configurable)" | Receive side, not `+zdbbl`. Do not conflate |
+| 2012 · 23 | "Fix missing accounting for outbound dist bytes" | Even WhatsApp had to patch BEAM to *see* dist throughput. Supports the "this is invisible" framing of conclusion 2 |
+| 2014 · 14 | "Use calls only when returning data, else cast · Make calls w/ timeouts only: no monitors · **Non-blocking casts (nosuspend) sometimes** · **Large distribution buffers**" | Two things at once: `nosuspend` as the real-world remedy (matches *Erlang in Anger*, novelty claim 2), and a major user raising dist buffers — with **no published numbers**, which is exactly the 13-year-old gap our sweep closes |
+| 2014 · 15 | "Work distribution: start with gen_server · Spread work to multiple workers: **gen_factory** · Spread dispatch to multiple procs: **gen_industry**" | The "shrink the population in front of the lock" pattern, productised internally |
+| 2014 · 28 | "Meta-clustering · Limit size of any single cluster · **wandist: dist-like transport over gen_tcp** · Transparent routing layer just above pg2 · All messages are single-hop" | The alternative answer — replace the transport (cf. Partisan). Useful contrast: `ecall` keeps stock distribution |
+| 2014 · 37 | "Watch for process message queue backlog · **Generally strive to remove all back pressure** · Bottlenecks show as backlog" | A **direct tension with conclusion 10a**, and a good one. Their operational stance is remove backpressure; our finding is that the busy limit *is* the clock that makes batches big. Both true, different goals — worth a paragraph, not a fight |
+| 2014 · 4, 8 | "342K peak msgs in/sec, 712K out"; per-node monitoring with a `dist msgin/msgout` column at ~231k/s across 408 nodes | Scale context. Their tooling counted dist messages per node as a first-class metric |
+
+Also on record: their patched BEAM was public as **`reedr/otp`** on GitHub
+(2014 · 35), and 2012 ran **OTP R14B03**, 2014 **R16B01 (+patches)** — worth one
+sentence, because it dates every fix above to before OTP 17.
+
+**Some of it reached upstream OTP, and one piece closes a loop on our own
+method.** From `erts/doc/notes.md` (local OTP checkout, grepped directly):
+
+| release | entry | note |
+|---|---|---|
+| **erts 5.9.2 (R15B02)** | OTP-10051 — *"Add port and suspend options to lock-counter profiling. **(Thanks to Rick Reed)**"* | This is 2012 · slide 23's bullet — "Add suspend, location, and port_locks options to `erts_debug:lock_counters`" — landing in OTP roughly six months after the talk |
+| erts 6.0 (OTP 17) | OTP-11809 — *"Use `closefrom/2` when available in child_setup (Thanks to Rick Reed and Anthony Ramine)"* | minor, but confirms sustained upstream contribution |
+
+The first row is worth a sentence in the article. **`lcnt` is our only instrument
+for conclusion 4b, and part of it was built by the person who found WhatsApp's
+contention with it** — the same tool his 2012 deck marked "invaluable!!!".
+
+Precision, so this does not become the next overclaim: our harness calls
+`lcnt:rt_mask([distribution])` / `lcnt:rt_collect()`
+([performance_metrics.erl:139](../test/performance/util/performance_metrics.erl#L139)),
+and the *runtime toggle* API is **OTP-13170 (OTP 20), credited to nobody
+external** — not Reed's patch. What he upstreamed is the port/suspend
+instrumentation; what his slide 23 also asked for ("Enable/disable process/port
+lock counting at runtime") OTP implemented independently five years later.
+Say "he extended the tool", not "he wrote the API we use".
+
+**Maxim Fedorov.** Real, and modest in what it gives us. Verified: **80 PRs to
+`erlang/otp`, 73 merged**; `pg` ([#2524](https://github.com/erlang/otp/pull/2524),
+merged 2020-02-06) whose rationale is *"no cluster lock required, and no
+dependency on global"* and scopes that *"decouple single mesh into a set of
+overlay networks, reducing amount of traffic required to propagate group
+membership information"*; and dist-adjacent PRs [#1569](https://github.com/erlang/otp/pull/1569)
+(>2 GB dist message crash), [#2625](https://github.com/erlang/otp/pull/2625),
+[#2654](https://github.com/erlang/otp/pull/2654) (concurrent TLS dist handshake).
+His *Scaling Erlang cluster to 10,000 nodes* (Code Mesh LDN, 2018) exists —
+**but its subject is cluster size, i.e. the N² connection mesh, not throughput
+on one channel.** Different axis from ours. Use it, if at all, for one line: the
+published WhatsApp scaling story is about *many nodes*; ours is about *many
+senders to one node*. I did not obtain the talk's content first-hand (video
+only, no transcript reachable) — **so do not quote it.**
+
+### 18b. Discord — nothing further to add
+
+Re-checked. The `manifold` README stays the citation. The 2017 blog post
+([discord.com/blog](https://discord.com/blog/how-discord-scaled-elixir-to-5-000-000-concurrent-users))
+adds two usable numbers — *"wall clock time of a single `send/2` call could
+range from 30μs to 70us due to Erlang de-scheduling the calling process"* and
+*"publishing an event from a large guild could take anywhere from 900ms to
+2.1s!"* — but its mechanism is **fan-out cost inside one sending process**,
+not contention on the shared dist queue, and `manifold`'s fix is per-call
+grouping, which conclusion 18's table already states correctly. The 2019 Rust
+post is about an immutable sorted-set data structure in a single process and is
+**irrelevant** to this article; it must not be cited as a distribution result.
 
 ### What is actually novel — ranked, after a second independent search
 
@@ -978,6 +1090,10 @@ and it must be cited. Our contribution is not the idea.
    open question with numbers. Supporting rhetorical point: **`+zdbbl` appears
    nowhere in *Erlang in Anger*** — Fred Hébert's remedy for `busy_dist_port`
    is `nosuspend`, not a bigger buffer.
+   **Strengthened by 18a:** WhatsApp's 2014 deck lists "Large distribution
+   buffers" and "Non-blocking casts (nosuspend) sometimes" side by side as
+   standing practice — **with no numbers attached**. The largest published
+   Erlang deployment of its era raised the buffer on faith too. That is the gap.
 3. **Mailbox-empty clocking as the faithful Nagle analogue.** Every prior
    batching layer *over distribution* uses a timer: Ostinelli 200 ms,
    `batched_communication` 100 ms, Broadway 1000 ms, brod's linger (off by
@@ -988,9 +1104,14 @@ and it must be cited. Our contribution is not the idea.
    analogue and a fixed timer is not** appears to be unmade in the Erlang
    literature. It is small, true, and quotable — a strong candidate for the
    spine of the article.
-4. **The pattern, named, with benchmarks.** It lives in library source and
-   scattered forum replies; no talk or post presents it as a technique with
-   numbers.
+4. **The pattern, with a mechanism and benchmarks.** ~~No talk or post presents
+   it as a technique.~~ **REVISED 2026-08-14 — WhatsApp does**, on slide 17 of
+   the 2014 deck: "Separate inter-node queues · Node-to-node message
+   forwarding · 'Queuer' FIFO worker dispatch" (18a). The surviving claim is
+   narrower and must be written narrowly: the technique is named in one 2014
+   slide bullet and implemented in library source, but **nobody has published
+   why it works or what it is worth**. We supply the lock, the sweep, and the
+   `after 0` clocking. Claim that, and cite Reed for the shape.
 
 ### ⚠️ The sharpest objection to our own story, and the answer
 
