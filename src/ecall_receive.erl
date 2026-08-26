@@ -44,13 +44,8 @@ pool_size()->
     {ok, PoolSize} when is_integer(PoolSize)->
       PoolSize;
     _->
-      Cores = erlang:system_info(logical_processors),
-      if
-        Cores >= 2 -> Cores div 2;
-        true -> 1
-      end
+      erlang:system_info(logical_processors)
   end.     
-
 
 
 master_loop( Workers )->
