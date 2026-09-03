@@ -10,7 +10,7 @@
 
 -define(STATE_KEY, {?MODULE, state}).
 -define(IMAGE, "ecall-performance:otp27").
--define(BASE_IMAGE, "ecall-performance-env:otp27").
+-define(BASE_IMAGE, "erlang:27.2.2").
 -define(PREBUILT_IMAGE_ENV, "ECALL_PERFORMANCE_PREBUILT_IMAGE").
 -define(COMMAND_TIMEOUT, 30000).
 -define(BUILD_TIMEOUT, 300000).
@@ -96,7 +96,6 @@ erl_args(Cookie, DistPort, EnvSettings) ->
   ["-pa" | container_code_paths()] ++
     [
       "-setcookie", Cookie,
-      "-emu_type", "lcnt",
       "+zdbbl", BusyKiB,
       "+P", integer_to_list(?PROCESS_LIMIT),
       "+Q", integer_to_list(?PORT_LIMIT),
@@ -350,6 +349,7 @@ ensure_prebuilt_image() ->
   ok.
 
 build_local_image(ProjectDir) ->
+  ok = ensure_base_image(),
   Dockerfile = filename:join([ProjectDir, "test", "performance", "Dockerfile"]),
   ct:pal("Rebuilding performance image ~s from current source", [?IMAGE]),
   command_ok(
@@ -363,6 +363,20 @@ build_local_image(ProjectDir) ->
       ProjectDir
     ],
     ?BUILD_TIMEOUT).
+
+ensure_base_image() ->
+  case run(
+         "docker",
+         ["image", "inspect", "--format={{.Id}}", ?BASE_IMAGE],
+         ?COMMAND_TIMEOUT) of
+    {0, _ImageID} ->
+      ok;
+    _Missing ->
+      ct:fail(
+        {base_image_missing, ?BASE_IMAGE,
+         "the base image is not in the local Docker image store and the "
+         "performance hosts have no registry access; load it there first"})
+  end.
 
 ensure_remote_image(Location) ->
   LocalImageID = local_image_id(),

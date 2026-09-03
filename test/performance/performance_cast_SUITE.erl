@@ -169,7 +169,7 @@ run_cast_point(Config) ->
         ElapsedMs = erlang:monotonic_time(millisecond) - StartedAt,
         MetricResults = performance_metrics:finish(Metrics),
         ok = stop_target(State2),
-        result_map(Point, State2, ElapsedMs, MetricResults)
+        result_map(Point, ElapsedMs, MetricResults)
       after
         performance_metrics:abort(Metrics)
       end
@@ -410,7 +410,7 @@ cleanup_point(#state{target_pid = Target, target_mon = TargetMon,
   erlang:demonitor(TargetMon, [flush]),
   ok.
 
-result_map(Point, State, ElapsedMs, Metrics) ->
+result_map(Point, ElapsedMs, Metrics) ->
   Base = #{
     suite => ?MODULE,
     operation => cast,
@@ -421,26 +421,9 @@ result_map(Point, State, ElapsedMs, Metrics) ->
     messages_per_writer => Point#point.messages_per_writer,
     pace_ms => Point#point.pace_ms,
     elapsed_ms => ElapsedMs,
-    performance_percent =>
-      performance_percent(
-        State#state.completed,
-        Point#point.writer_count,
-        Point#point.pace_ms,
-        ElapsedMs),
     metrics => Metrics
   },
   maps:merge(Base, Point#point.metadata).
-
-performance_percent(_Completed, _WriterCount, _PaceMs, 0) ->
-  0.0;
-performance_percent(Completed, WriterCount, PaceMs, ElapsedMs) ->
-  OperationsPerSecond =
-    operations_per_second(Completed, WriterCount, ElapsedMs),
-  ExpectedOperationsPerSecond = 1000 / PaceMs,
-  (OperationsPerSecond * 100) / ExpectedOperationsPerSecond.
-
-operations_per_second(Completed, WriterCount, ElapsedMs) ->
-  (Completed * 1000) / (WriterCount * ElapsedMs).
 
 
 %%====================================================================

@@ -13,23 +13,26 @@ function validNetwork(overrides = {}) {
   };
 }
 
-function validLoad(overrides = {}) {
-  return {average_1m: 12.75, ...overrides};
+function validSchedulers(overrides = {}) {
+  return {
+    utilization_percent: 72.5,
+    maximum_run_queue_length: 8,
+    ...overrides
+  };
 }
 
 function validMetrics(overrides = {}) {
   return {
     memory: {maximum_bytes: 1200},
-    locks: {wait_us: 50, collision_percent: 1.5},
     network: validNetwork(),
-    load: validLoad(),
+    schedulers: validSchedulers(),
     ...overrides
   };
 }
 
 function validPoint(overrides = {}) {
   return {
-    schema_version: 6,
+    schema_version: 7,
     operation: 'send',
     path: 'native',
     payload: 'tiny',
@@ -40,7 +43,6 @@ function validPoint(overrides = {}) {
     sender_config: 'local',
     receiver_config: 'runner@receiver.example.net',
     elapsed_ms: 1000,
-    performance_percent: 100,
     metrics: validMetrics(),
     ...overrides
   };
@@ -48,7 +50,8 @@ function validPoint(overrides = {}) {
 
 function schemaTwoPoint(overrides = {}) {
   const metrics = validMetrics();
-  delete metrics.load;
+  delete metrics.schedulers;
+  metrics.locks = {wait_us: 50, collision_percent: 1.5};
   return validPoint({schema_version: 2, metrics, ...overrides});
 }
 
@@ -132,7 +135,7 @@ test('skips JSON that does not match the point schema', async () => {
     await writeFile(
       path.join(dataDirectory, 'invalid-metric.json'),
       JSON.stringify(validPoint({
-        metrics: validMetrics({locks: {wait_us: '50', collision_percent: 1.5}})
+        metrics: validMetrics({memory: {maximum_bytes: '1200'}})
       })));
     await writeFile(
       path.join(dataDirectory, 'invalid-sender-config.json'),
@@ -152,7 +155,7 @@ test('skips JSON that does not match the point schema', async () => {
     assert.ok(result.runs[0].errors.some(
       error => error.message.endsWith('path')));
     assert.ok(result.runs[0].errors.some(
-      error => error.message.endsWith('metrics.locks.wait_us')));
+      error => error.message.endsWith('metrics.memory.maximum_bytes')));
     assert.ok(result.runs[0].errors.some(
       error => error.message.endsWith('sender_config')));
     assert.ok(result.runs[0].errors.some(
@@ -175,7 +178,7 @@ test('rejects schema-version-2 points with invalid network metrics', async () =>
     await mkdir(dataDirectory, {recursive: true});
     const withoutNetwork = validMetrics();
     delete withoutNetwork.network;
-    delete withoutNetwork.load;
+    delete withoutNetwork.schedulers;
     await writeFile(
       path.join(dataDirectory, 'missing-network.json'),
       JSON.stringify(schemaTwoPoint({metrics: withoutNetwork})));
@@ -207,49 +210,65 @@ test('rejects schema-version-2 points with invalid network metrics', async () =>
   }
 });
 
-test('rejects schema-version-6 points with invalid load metrics', async () => {
+test('rejects schema-version-7 points with invalid scheduler metrics', async () => {
   const temporaryRoot = await mkdtemp(
-    path.join(os.tmpdir(), 'ecall-performance-report-load-'));
+    path.join(os.tmpdir(), 'ecall-performance-report-schedulers-'));
   try {
     const dataDirectory = path.join(
       temporaryRoot,
-      'ct_run.load',
+      'ct_run.schedulers',
       'performance_send_SUITE.logs',
       'log_private',
       'performance_data');
     await mkdir(dataDirectory, {recursive: true});
-    const withoutLoad = validMetrics();
-    delete withoutLoad.load;
+    const withoutSchedulers = validMetrics();
+    delete withoutSchedulers.schedulers;
     await writeFile(
-      path.join(dataDirectory, 'missing-load.json'),
-      JSON.stringify(validPoint({metrics: withoutLoad})));
+      path.join(dataDirectory, 'missing-schedulers.json'),
+      JSON.stringify(validPoint({metrics: withoutSchedulers})));
     await writeFile(
-      path.join(dataDirectory, 'bad-average.json'),
+      path.join(dataDirectory, 'bad-utilization.json'),
       JSON.stringify(validPoint({
-        metrics: validMetrics({load: validLoad({average_1m: -1})})
+        metrics: validMetrics({
+          schedulers: validSchedulers({utilization_percent: -1})
+        })
       })));
     await writeFile(
-      path.join(dataDirectory, 'bad-type.json'),
+      path.join(dataDirectory, 'bad-utilization-type.json'),
       JSON.stringify(validPoint({
-        metrics: validMetrics({load: validLoad({average_1m: '12.75'})})
+        metrics: validMetrics({
+          schedulers: validSchedulers({utilization_percent: '72.5'})
+        })
+      })));
+    await writeFile(
+      path.join(dataDirectory, 'bad-run-queue.json'),
+      JSON.stringify(validPoint({
+        metrics: validMetrics({
+          schedulers: validSchedulers({maximum_run_queue_length: 8.5})
+        })
       })));
 
     const result = await scanRuns(temporaryRoot);
 
     assert.equal(result.runs[0].points.length, 0);
-    assert.equal(result.runs[0].errors.length, 3);
+    assert.equal(result.runs[0].errors.length, 4);
     assert.ok(result.runs[0].errors.some(
-      error => error.message.endsWith('metrics.load')));
+      error => error.message.endsWith('metrics.schedulers')));
     assert.equal(
       result.runs[0].errors.filter(
-        error => error.message.endsWith('metrics.load.average_1m')).length,
+        error =>
+          error.message.endsWith('metrics.schedulers.utilization_percent')
+      ).length,
       2);
+    assert.ok(result.runs[0].errors.some(
+      error =>
+        error.message.endsWith('metrics.schedulers.maximum_run_queue_length')));
   } finally {
     await rm(temporaryRoot, {recursive: true, force: true});
   }
 });
 
-test('accepts schema-version-2 points without load metrics', async () => {
+test('accepts schema-version-2 points without scheduler metrics', async () => {
   const temporaryRoot = await mkdtemp(
     path.join(os.tmpdir(), 'ecall-performance-report-legacy-v2-'));
   try {
@@ -269,7 +288,7 @@ test('accepts schema-version-2 points without load metrics', async () => {
     assert.equal(result.runs[0].points.length, 1);
     assert.equal(result.runs[0].errors.length, 0);
     assert.equal(result.runs[0].points[0].schema_version, 2);
-    assert.equal(result.runs[0].points[0].metrics.load, undefined);
+    assert.equal(result.runs[0].points[0].metrics.schedulers, undefined);
   } finally {
     await rm(temporaryRoot, {recursive: true, force: true});
   }

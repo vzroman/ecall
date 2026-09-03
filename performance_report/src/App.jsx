@@ -24,13 +24,13 @@ ChartJS.register(
 const REFRESH_INTERVAL_MS = 5000;
 const paths = ['native', 'ecall'];
 const metrics = [
-  {id: 'performance_percent', label: 'Performance', unit: '%', value: point => point.performance_percent},
+  {id: 'throughput', label: 'Throughput', unit: 'msg/s', value: point => (point.writer_count * point.messages_per_writer * 1000) / point.elapsed_ms},
+  {id: 'elapsed', label: 'Elapsed time', unit: 's', value: point => point.elapsed_ms / 1000},
   {id: 'maximum_memory', label: 'Maximum memory', unit: 'GB', value: point => point.metrics?.memory?.maximum_bytes / 1_000_000_000},
-  {id: 'lock_wait', label: 'Lock wait', unit: 'µs', value: point => point.metrics?.locks?.wait_us},
-  {id: 'lock_collision', label: 'Lock collisions', unit: '%', value: point => point.metrics?.locks?.collision_percent},
-  {id: 'net_throughput', label: 'Throughput', unit: 'MB/s', value: point => point.metrics?.network?.send_octets / (point.elapsed_ms / 1000) / 1_000_000},
-  {id: 'net_packet', label: 'Avg packet', unit: 'B', value: point => point.metrics?.network?.average_packet_bytes},
-  {id: 'load_1m', label: 'Load average', unit: '', value: point => point.metrics?.load?.average_1m}
+  {id: 'scheduler_utilization', label: 'Scheduler utilization', unit: '%', value: point => point.metrics?.schedulers?.utilization_percent},
+  {id: 'run_queue_max', label: 'Max run queue', unit: '', value: point => point.metrics?.schedulers?.maximum_run_queue_length},
+  {id: 'network', label: 'Network', unit: 'MB/s', value: point => point.metrics?.network?.send_octets / (point.elapsed_ms / 1000) / 1_000_000},
+  {id: 'net_packet', label: 'Avg packet', unit: 'B', value: point => point.metrics?.network?.average_packet_bytes}
 ];
 
 function configKey(point) {

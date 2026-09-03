@@ -12,9 +12,7 @@
 
 -define(TAG, ?MODULE).
 -define(SAMPLE_INTERVAL_MS, 100).
--define(DISTRIBUTION_LOCK, dist_entry_out_queue).
--define(SCHEMA_VERSION, 6).
--define(PROC_LOADAVG, "/proc/loadavg").
+-define(SCHEMA_VERSION, 7).
 
 -record(collector, {
   pid
@@ -25,13 +23,15 @@
   dist_port,
   sample_ref,
   timer_ref,
-  sample_count = 0,
   memory_max = 0,
   send_oct_base = 0,
   send_cnt_base = 0,
   send_oct_final = 0,
   send_cnt_final = 0,
-  load_sum = 0.0
+  scheduler_count = 0,
+  scheduler_base = #{},
+  scheduler_final = #{},
+  run_queue_max = 0
 }).
 
 -opaque collector() :: #collector{}.
@@ -136,7 +136,7 @@ request(#collector{pid = Pid}, Request) ->
 %%====================================================================
 
 collector_init(Owner, Ref, ReceiverNode) ->
-  ok = lcnt:rt_mask([distribution]),
+  _ = erlang:system_flag(scheduler_wall_time, true),
   _ = erlang:memory(total),
   Owner ! {?TAG, Ref, self(), ready},
   collector_wait(#state{receiver_node = ReceiverNode}).
@@ -145,12 +145,12 @@ collector_wait(State) ->
   receive
     {?TAG, Ref, From, begin_point} ->
       State1 = begin_network(State),
-      ok = lcnt:clear(),
+      State2 = begin_schedulers(State1),
       SampleRef = make_ref(),
-      State2 = sample(State1#state{sample_ref = SampleRef}),
+      State3 = sample(State2#state{sample_ref = SampleRef}),
       TimerRef = schedule_sample(SampleRef),
       From ! {?TAG, Ref, self(), begun},
-      collector_loop(State2#state{timer_ref = TimerRef});
+      collector_loop(State3#state{timer_ref = TimerRef});
     Message ->
       exit({unexpected_metrics_message, Message})
   end.
@@ -165,7 +165,8 @@ collector_loop(#state{sample_ref = SampleRef} = State) ->
       cancel_sample(State#state.timer_ref),
       State1 = sample(State),
       State2 = finish_network(State1),
-      Result = result(State2),
+      State3 = finish_schedulers(State2),
+      Result = result(State3),
       From ! {?TAG, Ref, self(), {finished, Result}},
       ok;
     Message ->
@@ -184,23 +185,20 @@ cancel_sample(TimerRef) ->
 %%====================================================================
 
 sample(#state{
-    sample_count = SampleCount,
     memory_max = MemoryMax,
-    load_sum = LoadSum} = State) ->
+    run_queue_max = RunQueueMax} = State) ->
   Memory = erlang:memory(total),
-  Load = read_load_average(),
+  RunQueue = erlang:statistics(total_run_queue_lengths),
   State#state{
-    sample_count = SampleCount + 1,
     memory_max = erlang:max(MemoryMax, Memory),
-    load_sum = LoadSum + Load
+    run_queue_max = erlang:max(RunQueueMax, RunQueue)
   }.
 
 result(#state{memory_max = MemoryMax} = State) ->
   #{
     memory => #{maximum_bytes => MemoryMax},
-    locks => lock_results(),
     network => network_result(State),
-    load => load_result(State)
+    schedulers => scheduler_result(State)
   }.
 
 
@@ -250,70 +248,45 @@ average_packet(SendOct, SendCnt) ->
 
 
 %%====================================================================
-%% Lock counters
+%% Scheduler metrics
 %%====================================================================
 
-lock_results() ->
-  Data = lcnt:rt_collect(),
-  Locks = proplists:get_value(locks, Data),
-  EntryLists =
-    [Entries
-     || {?DISTRIBUTION_LOCK, _Id, _Type, Entries} <- Locks],
-  true = EntryLists =/= [],
-  Stats =
-    lists:foldl(
-      fun combine_lock_entry/2,
-      empty_lock_stats(),
-      lists:append(EntryLists)),
-  lock_result(Stats).
-
-combine_lock_entry(
-    {{_File, _Line}, {Tries, Collisions, Wait}, _Histogram},
-    Stats) ->
-  add_lock_stats(
-    Stats,
-    #{tries => Tries, collisions => Collisions, wait_us => time_us(Wait)});
-combine_lock_entry(
-    {{_File, _Line}, {Tries, Collisions, Wait}},
-    Stats) ->
-  add_lock_stats(
-    Stats,
-    #{tries => Tries, collisions => Collisions, wait_us => time_us(Wait)}).
-
-empty_lock_stats() ->
-  #{tries => 0, collisions => 0, wait_us => 0}.
-
-add_lock_stats(Left, Right) ->
-  maps:map(
-    fun(Key, Value) -> Value + maps:get(Key, Right) end,
-    Left).
-
-lock_result(#{tries := Tries, collisions := Collisions, wait_us := WaitUs}) ->
-  #{
-    collision_percent => percent(Collisions, Tries),
-    wait_us => WaitUs
+begin_schedulers(State) ->
+  State#state{
+    scheduler_count = erlang:system_info(schedulers_online),
+    scheduler_base = scheduler_times()
   }.
 
-time_us({Seconds, Nanoseconds}) ->
-  Seconds * 1000000 + Nanoseconds div 1000;
-time_us({Seconds, Nanoseconds, _Samples}) ->
-  time_us({Seconds, Nanoseconds}).
+finish_schedulers(State) ->
+  State#state{scheduler_final = scheduler_times()}.
+
+scheduler_times() ->
+  maps:from_list(
+    [{Id, {Active, Total}}
+     || {Id, Active, Total} <- erlang:statistics(scheduler_wall_time)]).
+
+scheduler_result(#state{
+    scheduler_count = SchedulerCount,
+    scheduler_base = Base,
+    scheduler_final = Final,
+    run_queue_max = RunQueueMax}) ->
+  {Active, Total} =
+    lists:foldl(
+      fun(Id, Sums) -> add_scheduler_time(Id, Base, Final, Sums) end,
+      {0, 0},
+      lists:seq(1, SchedulerCount)),
+  #{
+    utilization_percent => percent(Active, Total),
+    maximum_run_queue_length => RunQueueMax
+  }.
+
+add_scheduler_time(Id, Base, Final, {ActiveSum, TotalSum}) ->
+  {BaseActive, BaseTotal} = maps:get(Id, Base),
+  {FinalActive, FinalTotal} = maps:get(Id, Final),
+  {ActiveSum + FinalActive - BaseActive,
+   TotalSum + FinalTotal - BaseTotal}.
 
 percent(_Part, 0) ->
   0.0;
 percent(Part, Whole) ->
   (Part * 100) / Whole.
-
-
-%%====================================================================
-%% Load metrics
-%%====================================================================
-
-load_result(#state{sample_count = SampleCount, load_sum = LoadSum}) ->
-  #{average_1m => LoadSum / SampleCount}.
-
-read_load_average() ->
-  {ok, Data} = file:read_file(?PROC_LOADAVG),
-  [LoadAverage1m | _] =
-    binary:split(Data, [<<" ">>, <<"\n">>], [global, trim_all]),
-  binary_to_float(LoadAverage1m).

@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=ecall-performance-env:otp27
+ARG BASE_IMAGE=erlang:27.2.2
 
 FROM ${BASE_IMAGE}
 

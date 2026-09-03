@@ -447,12 +447,6 @@ result_map(Point, ReceiverResults, Metrics) ->
     messages_per_writer => Point#point.messages_per_writer,
     pace_ms => Point#point.pace_ms,
     elapsed_ms => ElapsedMs,
-    performance_percent =>
-      performance_percent(
-        ReceiverResults#receiver_results.message_count,
-        Point#point.writer_count,
-        Point#point.pace_ms,
-        ElapsedMs),
     metrics => Metrics
   },
   maps:merge(Base, Point#point.metadata).
@@ -460,18 +454,6 @@ result_map(Point, ReceiverResults, Metrics) ->
 average_elapsed_ms(
     #receiver_results{average_elapsed_us = AverageElapsedUs}) ->
   AverageElapsedUs / 1000.
-
-performance_percent(_Completed, _WriterCount, _PaceMs, ElapsedMs)
-    when ElapsedMs == 0 ->
-  0.0;
-performance_percent(Completed, WriterCount, PaceMs, ElapsedMs) ->
-  OperationsPerSecond =
-    operations_per_second(Completed, WriterCount, ElapsedMs),
-  ExpectedOperationsPerSecond = 1000 / PaceMs,
-  (OperationsPerSecond * 100) / ExpectedOperationsPerSecond.
-
-operations_per_second(Completed, WriterCount, ElapsedMs) ->
-  (Completed * 1000) / (WriterCount * ElapsedMs).
 
 
 %%====================================================================

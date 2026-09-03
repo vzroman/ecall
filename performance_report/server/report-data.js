@@ -3,7 +3,7 @@ import path from 'node:path';
 
 const operations = new Set(['send', 'cast', 'call']);
 const paths = new Set(['native', 'ecall']);
-const schemaVersions = new Set([1, 2, 3, 4, 5, 6]);
+const schemaVersions = new Set([1, 2, 3, 4, 5, 6, 7]);
 
 function requireValue(condition, field) {
   if (!condition) {
@@ -50,30 +50,17 @@ function validatePoint(point) {
   requireValue(
     isFiniteNumber(point.elapsed_ms) && point.elapsed_ms >= 0,
     'elapsed_ms');
-  requireValue(
-    isFiniteNumber(point.performance_percent) &&
-      point.performance_percent >= 0,
-    'performance_percent');
 
   const memory = point.metrics?.memory;
   requireValue(
     isFiniteNumber(memory?.maximum_bytes) && memory.maximum_bytes >= 0,
     'metrics.memory.maximum_bytes');
 
-  const locks = point.metrics?.locks;
-  requireValue(
-    isFiniteNumber(locks?.wait_us) && locks.wait_us >= 0,
-    'metrics.locks.wait_us');
-  requireValue(
-    isFiniteNumber(locks?.collision_percent) &&
-      locks.collision_percent >= 0,
-    'metrics.locks.collision_percent');
-
   if (point.schema_version >= 2) {
     validateNetwork(point.metrics?.network);
   }
-  if (point.schema_version >= 4) {
-    validateLoad(point.metrics?.load);
+  if (point.schema_version >= 7) {
+    validateSchedulers(point.metrics?.schedulers);
   }
   return point;
 }
@@ -93,11 +80,18 @@ function validateNetwork(network) {
     'metrics.network.average_packet_bytes');
 }
 
-function validateLoad(load) {
+function validateSchedulers(schedulers) {
   requireValue(
-    load !== null && typeof load === 'object' && !Array.isArray(load),
-    'metrics.load');
-  validateNonNegativeNumber(load.average_1m, 'metrics.load.average_1m');
+    schedulers !== null && typeof schedulers === 'object' &&
+      !Array.isArray(schedulers),
+    'metrics.schedulers');
+  validateNonNegativeNumber(
+    schedulers.utilization_percent,
+    'metrics.schedulers.utilization_percent');
+  requireValue(
+    Number.isInteger(schedulers.maximum_run_queue_length) &&
+      schedulers.maximum_run_queue_length >= 0,
+    'metrics.schedulers.maximum_run_queue_length');
 }
 
 async function pointFiles(directory) {

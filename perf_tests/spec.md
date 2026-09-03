@@ -146,17 +146,25 @@ The fixed role image is `ecall-performance:otp27` and uses OTP 27. Its build
 context contains the compiled application, performance suites, and utility
 modules. The application is available at `/opt/ecall` in the container.
 
-The role image is built on `ecall-performance-env:otp27`. The environment image
-contains OTP and the `beam.lcnt` emulator and is built once with:
+The role image is built on the official `erlang:27.2.2` image. Rebuilding the
+role image only copies the current checkout over that base image; it does not
+run commands or build OTP from source. The harness runs the stock emulator; no
+lock-counting emulator is built or deployed.
+
+The host that rebuilds the role image must already hold `erlang:27.2.2` in its
+local Docker image store. The performance hosts have no registry access, and
+BuildKit resolves the `FROM` reference before the first layer, so a missing base
+image fails the build outright rather than falling back to anything local. The
+image is put there once, from a machine that can reach the registry:
 
 ```text
-make performance_env
+docker pull erlang:27.2.2
+docker save erlang:27.2.2 | gzip -1 | ssh <user>@<host> docker load
 ```
 
-The environment image is deployed to an offline controller before running the
-suite. Rebuilding the role image then only copies the current checkout over the
-environment image; it does not run commands, access a registry, or download OTP
-sources.
+`start_nodes/1` checks for the base image before it shells out to `docker build`
+and fails the suite with `base_image_missing` when it is absent, so the missing
+prerequisite is named directly instead of surfacing as a registry timeout.
 
 Role containers use host networking so Erlang distribution is reachable
 between the controller and both Docker hosts. The controller and peers use
@@ -455,7 +463,7 @@ appropriate.
 
 ## Point metrics
 
-Every successful point collects memory, lock, network, and load metrics from the
+Every successful point collects memory, network, and scheduler metrics from the
 sender node.
 
 ### Collector lifecycle
@@ -466,14 +474,15 @@ until it is ready.
 
 The measured point follows this sequence:
 
-1. Start the sender metrics collector for the receiver node.
-2. Resolve the distribution channel to the receiver, read the baseline
-   distribution socket counters, and clear lock counters on the sender node.
+1. Start the sender metrics collector for the receiver node, which enables
+   scheduler wall-time measurement on the sender node.
+2. Resolve the distribution channel to the receiver and read the baseline
+   distribution socket counters and scheduler wall times.
 3. Record the point start time and release the writers.
-4. Every 100 milliseconds, sample total memory and the 1-minute load average.
+4. Every 100 milliseconds, sample total memory and the total run-queue length.
 5. Stop collection when the point completion condition is met.
-6. Read the final distribution socket counters, collect the lock-counter
-   results, and build the point result.
+6. Read the final distribution socket counters and scheduler wall times, and
+   build the point result.
 
 The collector keeps aggregates only. It does not retain or log the complete
 sample series, and it does not report sampling-health metrics. There are no
@@ -490,17 +499,43 @@ erlang:memory(total)
 The point result contains the maximum total memory in bytes. The tests do not
 read Linux `/proc` memory information.
 
-### Lock metrics
+### Scheduler metrics
 
-The sender node runs an OTP lock-counting emulator. Immediately before the
-writers are released, the collector calls `lcnt:clear/0`. After point
-completion, it calls `lcnt:rt_collect/0`.
+Scheduler metrics describe how heavily the sender node's own schedulers are
+used and how much work is queued behind them. Both are VM-level values read on
+the sender only; the receiver host is not measured.
 
-The lock-counter mask is restricted to the distribution category, which is the
-narrowest category supported by OTP for this lock. The result retains only
-`dist_entry_out_queue` and combines all of its instances. No other locks are
-reported. The result contains accumulated wait time and collision percentage.
-Lock counters are not sampled every 100 milliseconds.
+The collector enables `erlang:system_flag(scheduler_wall_time, true)` when it
+starts and reads `erlang:statistics(scheduler_wall_time)` once at
+`begin_point` and once at completion. Only the online normal schedulers are
+counted, that is the entries whose scheduler identifier is at most
+`erlang:system_info(schedulers_online)`; the dirty schedulers that the same
+call reports are excluded, because this workload runs no dirty work and their
+idle time would only dilute the value. `utilization_percent` is the summed
+active-time delta divided by the summed total-time delta, in percent, over the
+point. It is `0.0` when the total delta is zero. The flag is enabled per
+collector process, so it is on only while a point is measured, and the deltas
+never carry work from an earlier point.
+
+`maximum_run_queue_length` is the largest value of
+`erlang:statistics(total_run_queue_lengths)` observed on the 100-millisecond
+sample loop. It counts the processes and ports that are ready to run and
+waiting for a scheduler; entities currently executing are not in a run queue.
+It is a maximum rather than a mean, because a queue that builds up at any point
+in the run is what shows the sender is scheduler-bound. The cheaper
+`total_run_queue_lengths` is read rather than `run_queue`: it needs no
+thread-progress synchronization, and the sampled maximum does not need the
+exactness the more expensive call buys.
+
+The harness measures no host-level load. The Linux load average is an
+exponentially weighted moving average whose window is far longer than one point,
+and points run consecutively without a cooldown, so a value observed during a
+point still carries most of the preceding ones; it cannot separate consecutive
+points of different paths. Host CPU utilization is not measured either: a
+whole-host busy percentage normalized over all cores is not comparable with the
+per-core percentages `top` reports, saturates at 100 percent once the host is
+oversubscribed, and includes every other process on the host. Scheduler
+utilization is the sender node's own figure and carries neither problem.
 
 ### Network metrics
 
@@ -514,8 +549,8 @@ The collector resolves the channel once, at `begin_point`, from
 receiver node. On the default `inet_tcp_dist` transport used by the harness this
 is the `tcp_inet` distribution port. If the receiver is not connected, resolving
 the port fails and the point fails, consistent with the crash-forward policy.
-Metrics are collected on the sender node only, alongside the memory and lock
-metrics.
+Metrics are collected on the sender node only, alongside the memory and
+scheduler metrics.
 
 Cumulative socket counters are read once at `begin_point` and once at
 completion and reported as the completion-minus-baseline delta. The connection
@@ -542,38 +577,6 @@ enough to take the limit out of the measurement; the count then reports how
 often that limit was nevertheless reached rather than how deep the backlog grew.
 The queue that does grow, the ERTS distribution output queue, has no BIF that
 exposes its size, and it is visible only as sender memory.
-
-### Load metrics
-
-Load metrics describe how heavily the operating system the sender node runs on is
-loaded. They are read from Linux `/proc/loadavg` on the sender only; the receiver
-host is not measured. The file is not namespaced by Linux, so a containerized
-sender reports the values of its host, including any work outside the container.
-The harness runs one sender container per host, so the reported values are
-dominated by the measured node.
-
-The file is read directly. The harness does not start `os_mon`, because `cpu_sup`
-would add an application and a port program to the peer node for a value that is
-one `file:read_file/1` away.
-
-Linux offers exactly three load-average intervals, 1, 5, and 15 minutes. The
-harness reports only the 1-minute figure, because the longer windows carry even
-less of the measured point. It is sampled on the same 100-millisecond loop as
-memory and reported as `average_1m`, the mean over the point. It is not read only
-once at completion; a completion-only reading would report whichever instant the
-point happened to end on rather than the point as a whole.
-
-The load average is an exponentially weighted moving average whose window is far
-longer than one point, and points run consecutively without a cooldown, so the
-value observed during a point still carries most of the preceding points. It is
-an indicator of accumulated background pressure rather than of the point itself,
-and it lags: a point cannot move it far, so consecutive points of different paths
-are not cleanly separated by it.
-
-The harness does not measure CPU utilization. A whole-host busy percentage
-normalized over all cores is not comparable with the per-core percentages `top`
-reports, saturates at 100 percent once the host is oversubscribed, and includes
-every other process on the host.
 
 ## Result storage and reporting
 
@@ -609,13 +612,14 @@ The logged and stored result contains:
 - distribution busy limit in KiB;
 - sanitized sender and receiver configuration;
 - elapsed monotonic time;
-- performance percentage relative to the configured per-writer pace;
-- sender memory, lock, network, and load metrics.
+- sender memory, network, and scheduler metrics.
 
-The expected operations per second for one writer is `1000 / pace_ms`.
-`performance_percent` is the measured per-writer operations per second divided
-by that expected rate and multiplied by 100. A value of `100.0` means the
-configured pace was sustained.
+The result carries no pace-relative percentage. The configured pace bounds the
+offered rate, so such a percentage saturates at `100.0` for every point that
+keeps up and reports how far a point fell behind its own throttle rather than
+what the path achieved. Throughput, in messages per second, is the headline
+figure instead, and `pace_ms` remains in the result as the workload parameter
+that produced it.
 
 Expected and completed operation counts remain internal completion invariants.
 They are not included in the successful point log entry.
@@ -630,17 +634,19 @@ log_private/
     send.ecall.tiny.10000.json
 ```
 
-The JSON object has `schema_version` set to `6` and otherwise preserves the
+The JSON object has `schema_version` set to `7` and otherwise preserves the
 result-map structure. Sender and receiver configurations are JSON strings.
 OTP's `json:encode/1` performs the encoding. The file is written directly to
 its final name; there is no temporary-file protocol. A reader can observe an
 incomplete file while the write is in progress. For compatibility, the parser
 also accepts existing files of every earlier schema version: version 1 without
-role configuration, network metrics, or load metrics, and versions 2 and 3
-without load metrics. Earlier versions also carried metrics that are no longer
-produced, among them a version 3 CPU-utilization block; the parser requires only
-the metrics the report presents and ignores the rest wherever it appears. The
-frontend presents missing roles as `Unavailable` and missing metrics as `N/A`.
+role configuration or network metrics, and versions 1 to 6 without scheduler
+metrics. Earlier versions also carried metrics that are no longer produced,
+among them a version 3 CPU-utilization block, the lock block of versions 1 to 6,
+the load block of versions 4 to 6, and the `performance_percent` field of
+versions 1 to 6; the parser requires only the metrics the report presents and
+ignores the rest wherever it appears. The frontend presents missing roles as
+`Unavailable` and missing metrics as `N/A`.
 
 A JSON write error fails at the file operation. Failed performance points do
 not produce JSON. Their diagnosis remains in the standard Common Test report,
@@ -684,33 +690,37 @@ pace, distribution busy limit, sender, and receiver. `writer_count` is the
 horizontal variable for both grids and charts.
 
 Grid columns are the writer counts sorted numerically in ascending order. Grid
-rows identify the path and metric, for example native performance percentage,
-`ecall` performance percentage, native maximum memory, and `ecall` maximum
-memory.
+rows identify the path and metric, for example native throughput, `ecall`
+throughput, native maximum memory, and `ecall` maximum memory.
 
 Charts use a numeric `writer_count` X axis. Native and `ecall` are separate
 series. The reported trends cover:
 
-- performance percentage;
+- throughput, in messages per second;
+- elapsed time;
 - maximum memory;
-- lock wait;
-- lock collision percentage;
-- distribution throughput (`send_octets` divided by the elapsed seconds);
-- average distribution packet size;
-- sender average 1-minute load average.
+- sender scheduler utilization;
+- sender maximum run-queue length;
+- network, the distribution byte rate (`send_octets` divided by the elapsed
+  seconds);
+- average distribution packet size.
 
-Every metric in the point result appears in the report, either as a trend of its
-own or as an input to a derived one; the harness does not collect metrics it does
-not present. Throughput is the one derived trend: the report computes it from
-`send_octets` and the point `elapsed_ms` and reports it in decimal megabytes per
-second.
+Throughput is the report's primary trend and its first grid row. Every metric in
+the point result appears in the report, either as a trend of its own or as an
+input to a derived one; the harness does not collect metrics it does not
+present. Two trends are derived rather than stored. Throughput is `writer_count`
+multiplied by `messages_per_writer` and divided by the elapsed seconds, in
+messages per second; a point completes only when every planned operation is
+confirmed, so the planned count is also the completed one. The network trend is
+`send_octets` divided by the elapsed seconds, in decimal megabytes per second.
 
-Network trends are absent for schema-version-1 points, and load trends are absent
-for schema versions 1 through 3. They are shown as gaps or `N/A`; they are never
-converted to zero.
+The network and average-packet trends are absent for schema-version-1 points,
+and the scheduler trends are absent for schema versions 1 through 6. They are
+shown as gaps or `N/A`; they are never converted to zero.
 
 Maximum memory is stored as bytes but converted to decimal gigabytes (bytes
-divided by `1,000,000,000`) in both grids and charts.
+divided by `1,000,000,000`) in both grids and charts. Elapsed time is stored as
+`elapsed_ms` but presented in seconds in the same way.
 
 A series is identified by the run, operation, payload, path, messages per
 writer, pace, distribution busy limit, sender, receiver, and metric. Each
@@ -755,8 +765,8 @@ The workload layer is complete when:
 - every successful call point validates the exact reply count;
 - participant or connection failure fails the point instead of producing a
   partial result;
-- every successful point contains sender memory, combined lock metrics, and
-  distribution channel network metrics;
+- every successful point contains sender memory, scheduler, and distribution
+  channel network metrics;
 - every successful point is logged by `performance_metrics:point/2` and saved
   as one JSON file containing `distribution_busy_limit_kib` and sanitized
   sender and receiver configuration, without a password;
@@ -764,4 +774,5 @@ The workload layer is complete when:
   Test runs and reports invalid files without discarding other results;
 - one report page links to every parsed run and compares native and `ecall`
   metrics in grids and charts using `writer_count` as the horizontal variable;
-- both memory metrics are presented in decimal gigabytes.
+- maximum memory is presented in decimal gigabytes and elapsed time in
+  seconds.
