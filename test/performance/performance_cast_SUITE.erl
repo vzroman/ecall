@@ -16,7 +16,6 @@
 ]).
 
 -define(TAG, ?MODULE).
--define(RPC_TIMEOUT, 30000).
 -define(PAYLOAD_KEY, {?MODULE, payload}).
 
 -record(point, {
@@ -42,10 +41,10 @@
 
 -record(state, {
   point,
-  target_pid,
-  target_mon,
-  target_ready = false,
-  target_done = false,
+  target_pids = [],
+  target_mons = #{},
+  targets_ready = 0,
+  targets_done = 0,
   target_count = 0,
   writer_pids = [],
   ready = 0,
@@ -198,52 +197,66 @@ cast_point(Config) ->
   }.
 
 start_participants(Point) ->
-  Target = start_cast_counter(Point),
-  TargetMon = erlang:monitor(process, Target),
+  Targets = start_cast_counters(Point),
+  TargetMons = monitor_targets(Targets),
   Writer = #writer{
     run_ref = Point#point.run_ref,
     path = Point#point.path,
     receiver_node = Point#point.receiver_node,
-    target = Target,
     messages_per_writer = Point#point.messages_per_writer,
     pace_ms = Point#point.pace_ms
   },
-  WriterPids = start_writers(Point#point.writer_count, Writer),
+  WriterPids = start_writers(Targets, Writer),
   #state{
     point = Point,
-    target_pid = Target,
-    target_mon = TargetMon,
+    target_pids = Targets,
+    target_mons = TargetMons,
     writer_pids = WriterPids
   }.
+
+start_cast_counters(#point{
+    writer_count = WriterCount} = Point) ->
+  start_cast_counters(WriterCount, Point, []).
+
+start_cast_counters(0, _Point, Targets) ->
+  Targets;
+start_cast_counters(Count, Point, Targets) when Count > 0 ->
+  Target = start_cast_counter(Point),
+  start_cast_counters(Count - 1, Point, [Target | Targets]).
 
 start_cast_counter(#point{
     run_ref = RunRef,
     receiver_node = Node,
-    expected = Expected}) ->
+    messages_per_writer = Expected}) ->
   Coordinator = self(),
-  erpc:call(
+  spawn_opt(
     Node,
     fun() ->
-      spawn(fun() ->
-        Coordinator ! {?TAG, RunRef, target_ready, self()},
-        cast_counter_loop(RunRef, Coordinator, Expected, 0)
-      end)
+      Coordinator ! {?TAG, RunRef, target_ready, self()},
+      cast_counter_loop(RunRef, Coordinator, Expected, 0)
     end,
-    ?RPC_TIMEOUT).
+    [{message_queue_data, off_heap}]).
 
-start_writers(Count, Writer) ->
-  start_writers(Count, Writer, self(), []).
+monitor_targets(Targets) ->
+  maps:from_list([
+    {Target, erlang:monitor(process, Target)}
+    || Target <- Targets
+  ]).
 
-start_writers(0, _Writer, _Coordinator, Acc) ->
+start_writers(Targets, Writer) ->
+  start_writers(Targets, Writer, self(), []).
+
+start_writers([], _Writer, _Coordinator, Acc) ->
   Acc;
-start_writers(Count, Writer, Coordinator, Acc) when Count > 0 ->
-  {Pid, _Mon} = spawn_monitor(fun() -> writer_loop(Writer, Coordinator) end),
-  start_writers(Count - 1, Writer, Coordinator, [Pid | Acc]).
+start_writers([Target | Rest], Writer, Coordinator, Acc) ->
+  Writer1 = Writer#writer{target = Target},
+  {Pid, _Mon} = spawn_monitor(fun() -> writer_loop(Writer1, Coordinator) end),
+  start_writers(Rest, Writer, Coordinator, [Pid | Acc]).
 
 await_ready(#state{
     point = #point{writer_count = WriterCount},
     ready = WriterCount,
-    target_ready = true} = State) ->
+    targets_ready = WriterCount} = State) ->
   State;
 await_ready(State) ->
   receive
@@ -253,8 +266,8 @@ await_ready(State) ->
 
 handle_ready_message({?TAG, RunRef, target_ready, Target}, State)
     when RunRef =:= (State#state.point)#point.run_ref,
-         Target =:= State#state.target_pid ->
-  State#state{target_ready = true};
+         is_map_key(Target, State#state.target_mons) ->
+  State#state{targets_ready = State#state.targets_ready + 1};
 handle_ready_message({?TAG, RunRef, writer_ready, _Pid}, State)
     when RunRef =:= (State#state.point)#point.run_ref ->
   State#state{ready = State#state.ready + 1};
@@ -273,7 +286,7 @@ await_completion(#state{
     point = #point{writer_count = WriterCount, expected = Expected},
     writer_completed = WriterCount,
     writer_down = WriterCount,
-    target_done = true,
+    targets_done = WriterCount,
     target_count = Expected,
     completed = Expected} = State) ->
   State;
@@ -285,9 +298,12 @@ await_completion(State) ->
 
 handle_completion_message({?TAG, RunRef, target_completed, Target, Count}, State)
     when RunRef =:= (State#state.point)#point.run_ref,
-         Target =:= State#state.target_pid ->
-  Count = (State#state.point)#point.expected,
-  State#state{target_done = true, target_count = Count};
+         is_map_key(Target, State#state.target_mons) ->
+  Count = (State#state.point)#point.messages_per_writer,
+  State#state{
+    targets_done = State#state.targets_done + 1,
+    target_count = State#state.target_count + Count
+  };
 handle_completion_message({?TAG, RunRef, writer_completed, _Pid, Count}, State)
     when RunRef =:= (State#state.point)#point.run_ref ->
   Count = (State#state.point)#point.messages_per_writer,
@@ -303,11 +319,13 @@ handle_completion_message({'DOWN', _Mon, process, _Pid, _Reason} = Message, Stat
 handle_completion_message(Message, _State) ->
   exit({unexpected_completion_message, Message}).
 
-handle_participant_down({'DOWN', Mon, process, Pid, normal}, State)
-    when Mon =:= State#state.target_mon ->
-  exit({target_down_before_stop, Pid});
-handle_participant_down({'DOWN', _Mon, process, _Pid, normal}, State) ->
-  State#state{writer_down = State#state.writer_down + 1};
+handle_participant_down({'DOWN', Mon, process, Pid, normal}, State) ->
+  case maps:find(Pid, State#state.target_mons) of
+    {ok, Mon} ->
+      exit({target_down_before_stop, Pid});
+    error ->
+      State#state{writer_down = State#state.writer_down + 1}
+  end;
 handle_participant_down({'DOWN', _Mon, process, Pid, Reason}, _State) ->
   exit({process_failed, Pid, Reason}).
 
@@ -338,9 +356,14 @@ writer_operations(
     Seq,
     Completed,
     #writer{pace_ms = PaceMs} = Writer) ->
+  StartedAt = erlang:monotonic_time(millisecond),
   ok = cast_operation(Writer),
-  ok = timer:sleep(PaceMs),
+  ok = sleep_remaining_pace(PaceMs, StartedAt),
   writer_operations(Seq + 1, Completed + 1, Writer).
+
+sleep_remaining_pace(PaceMs, StartedAt) ->
+  ElapsedMs = erlang:monotonic_time(millisecond) - StartedAt,
+  timer:sleep(erlang:max(PaceMs - ElapsedMs, 0)).
 
 cast_operation(#writer{
     path = native,
@@ -386,28 +409,36 @@ cast_counter_loop(RunRef, Coordinator, Expected, Count) ->
 
 stop_target(#state{
     point = #point{run_ref = RunRef},
-    target_pid = Target,
-    target_mon = TargetMon}) ->
-  Target ! {?TAG, RunRef, stop, self()},
-  wait_target_stopped(RunRef, Target, TargetMon, true, true).
+    target_pids = Targets,
+    target_mons = TargetMons}) ->
+  [Target ! {?TAG, RunRef, stop, self()} || Target <- Targets],
+  wait_targets_stopped(RunRef, TargetMons, TargetMons).
 
-wait_target_stopped(_RunRef, _Target, _TargetMon, false, false) ->
+wait_targets_stopped(_RunRef, Empty, Empty) when map_size(Empty) =:= 0 ->
   ok;
-wait_target_stopped(RunRef, Target, TargetMon, NeedAck, NeedDown) ->
+wait_targets_stopped(RunRef, PendingAcks, PendingDowns) ->
   receive
     {?TAG, RunRef, target_stopped, Target, _Count} ->
-      wait_target_stopped(RunRef, Target, TargetMon, false, NeedDown);
+      true = is_map_key(Target, PendingAcks),
+      wait_targets_stopped(
+        RunRef,
+        maps:remove(Target, PendingAcks),
+        PendingDowns);
     {'DOWN', TargetMon, process, Target, normal} ->
-      wait_target_stopped(RunRef, Target, TargetMon, NeedAck, false);
+      TargetMon = maps:get(Target, PendingDowns),
+      wait_targets_stopped(
+        RunRef,
+        PendingAcks,
+        maps:remove(Target, PendingDowns));
     Message ->
       exit({unexpected_stop_message, Message})
   end.
 
-cleanup_point(#state{target_pid = Target, target_mon = TargetMon,
+cleanup_point(#state{target_pids = Targets, target_mons = TargetMons,
                      writer_pids = WriterPids}) ->
   [exit(Pid, kill) || Pid <- WriterPids],
-  exit(Target, kill),
-  erlang:demonitor(TargetMon, [flush]),
+  [exit(Target, kill) || Target <- Targets],
+  [erlang:demonitor(TargetMon, [flush]) || TargetMon <- maps:values(TargetMons)],
   ok.
 
 result_map(Point, ElapsedMs, Metrics) ->

@@ -293,9 +293,14 @@ writer_operations(
     Seq,
     Completed,
     #writer{pace_ms = PaceMs} = Writer) ->
+  StartedAt = erlang:monotonic_time(millisecond),
   ok = call_operation(Writer),
-  ok = timer:sleep(PaceMs),
+  ok = sleep_remaining_pace(PaceMs, StartedAt),
   writer_operations(Seq + 1, Completed + 1, Writer).
+
+sleep_remaining_pace(PaceMs, StartedAt) ->
+  ElapsedMs = erlang:monotonic_time(millisecond) - StartedAt,
+  timer:sleep(erlang:max(PaceMs - ElapsedMs, 0)).
 
 call_operation(#writer{
     path = native,

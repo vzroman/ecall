@@ -418,9 +418,14 @@ writer_operations(Seq, Writer)
 writer_operations(
     Seq,
     #writer{pace_ms = PaceMs} = Writer) ->
+  StartedAt = erlang:monotonic_time(millisecond),
   ok = send_operation(Writer),
-  ok = timer:sleep(PaceMs),
+  ok = sleep_remaining_pace(PaceMs, StartedAt),
   writer_operations(Seq + 1, Writer).
+
+sleep_remaining_pace(PaceMs, StartedAt) ->
+  ElapsedMs = erlang:monotonic_time(millisecond) - StartedAt,
+  timer:sleep(erlang:max(PaceMs - ElapsedMs, 0)).
 
 send_operation(#writer{path = native, receiver = Receiver}) ->
   Payload = persistent_term:get(?PAYLOAD_KEY),
