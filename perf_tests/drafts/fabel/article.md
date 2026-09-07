@@ -61,7 +61,7 @@ We could have taken a handful of processes and made them send as fast as possibl
 
 ## How we ran into it
 
-We built a SCADA system that processes hundreds of thousands of signals per second. A signal arriving on one node is not done when it is written locally: it also goes to neighbouring nodes, where it is fanned out to subscribers, fed into further calculations, and stored in the database.
+We built a SCADA/EMS system for a national electricity grid operator that processes hundreds of thousands of signals per second. A signal arriving on one node is not done when it is written locally: it also goes to neighbouring nodes, where it is fanned out to subscribers, fed into further calculations, and stored in the database.
 
 At a certain load the system started to degrade, and not gracefully. Remote messaging slowed down first, but soon the whole VM was barely responsive. The investigation pointed at `erpc:cast/4`, which carried the inter-node traffic: it was consuming almost all the resources of the node. Our first thought was that `erpc` itself was the problem. Looking deeper showed that `erpc` was only using the same transport as everything else. Every message between two nodes, whether a plain send or an `erpc` spawn request, passes through the same distribution queue, and that queue was where the contention was.
 
