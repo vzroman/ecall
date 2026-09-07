@@ -1,28 +1,32 @@
 The task is to prepare an article intenden for publishing on:
-* dev.to
-* Hashnode
-* Medium
-* forums.erlang.org
-* elixirforum.com
-* Erlang Solutions Blog
-* Hacker News (news.ycombinator.com) & Lobsters (lobste.rs)
-* linkedin
+dev.to
+Hashnode
+Medium
+forums.erlang.org
+elixirforum.com
+Erlang Solutions Blog
+Hacker News (news.ycombinator.com) & Lobsters (lobste.rs)
+linkedin
 The list is preliminary.
 
-We go step by step:
------------phase 1----------------------
+
 You learn carefully:
-* perf_tests/findings.md
+* all the docs in perf_tests folder and relevant docs they reference. Claims in perf_tests/investigation.md override other findings/conclusions.
 * the project's source code
-* performance tests source code under test/performance
-* tests results under /home/roman/WORKTEMP/202608/ecall/good_samples
-------------phase 2----------------------------
-You synthesize all together and prepare conclusions. You save them in perf_tests/main_conclusions.md. Then you agree with me each in a step in an interview mode (brainstorming). On our way you add/edit/delete them and mark as agreed.
------------phase 3------------------------------
-You do a thorough web research. The goal is to find examples of articles that can be helpful for our article like style, level of detalization, flow etc. You save the links and main findings for each in perf_tests/reasearch.md 
------------phase 4---------------------------------
-You prepare the article's structure. What blocks should it have. The main idea for each block. What screenshots/test results we can use etc. The flow you present and agree with me the structure. Then you agree with me each block step by step (not all at once). The structure may transform on our way. It's an interractive brainstorming phase. On our way you save agreed structure and blocks in perf_tests/article_structure.md. Additionally you save the log of our conversation in perf_tests/discussion.md (it's supposed to be used to restore the phase context if the work is interrupted and continued in another session)
----------phase 5-------------------------------------
-implemantion
-----------phase 6-------------------------------------
-review
+* tests results under /home/roman/WORKTEMP/202609/ecall/tests. Numbers from them override other tests results (where they intersect). Use messages per second as the main metric.
+As the main example we take https://www.erlang.org/blog/parallel-signal-sending-optimization/. I like it's narrative. I suggest to organize the article the way it extrapolates the problem to distributed messaging. The article should remind the many-to-one problem for local messaging and then claim that the problem is still actual for distributed messaging. While there may be many processes receiving messages on the other side the contention is still about a single point - distributed queue. Here we should provide an evidence - tests results for distributed message passing (native only). Here we need to explain that we chose the load with increasing the number of processes instead of increasing just pace to resemble a real system where a process does some useful work, not only message passing. Then we should give our story where we first encountered the problem. 
+Our story:
+We built a SCADA system that was processing a lot of signals (hundreds of thousands per second). The signals arriving at one node were aslo to be passed to neighboring nodes for distributing between subscribers, additional calculations, stored in a database etc. At certain point we noticed that the system staretd to degrade significantly, not only messaging was slow buth the whole VM was almost stuck. The investigation showed that the bottleneck was in erpc:cast. It were consuming almost all the resources. At first we thougth that the problen was in erpc itself, but more deeper investigation showed that the main bottleneck was around distributed messaging and erpc just uses the same transport. All the messages between 2 nodes pass the same distribution queue. And this where the contention actually is. It resembles many-to-one pattern, but has a bit different shape. For local message pssing with on_heap the saturation picture is schedulers almost 100% busy but OS reports CPU consumption low. For the distributed messaging OS reports the CPU almost full busy (>4600%) for 48 cores box. This is because of the lock nature that is described in perf_tests/investigation.md. We should not provide all the details, but mention that locks for distrubuted queue have different nature and the main work here is enqueue mechanics. When the queue is saturated the writers take a long path (give some details here). So the main contention here is about enqueing procedure. We tried to increase +zdbbl - it only chaged the profile (saw) but not solved the problem. async_dist led to memory grow and VM killed. Then we tried the approach from https://www.ostinelli.net/boost-message-passing-between-erlang-nodes/ - batching, but with no wait for 200ms. It gave good results. But they were not enough because we hit the limit with only one process (scheduler) that sends. At certain point the process is not able to keep up and its message queue become grow. So we implemented a pool of processes. And that solution satisfied our demand. Returning to our original problem (erpc:cast) we were not able to make erpc go through our path so we implemented ecall. It uses our message transport for cast/call. It solved our problem. Further we built multi-node cast/call patterns (call_one, call_all_wait etc) over it. After that you provide test results and additional explanation. What needs noting is reduction in resource consuption with ecall path. ecall needs much less memory and CPU. 
+
+
+We suggest a solution (ecall) that is based on the next main principles:
+* batching. We reduce distributed queue contention by reducing the number of enqueing calls and increasing the number of messages per one enqueue. It's the same principle as in https://www.ostinelli.net/boost-message-passing-between-erlang-nodes/ but we take it further.
+* having pool of senders/receivers instead of 1 process. It helps to utilize more cores and avoid a bottleneck whe a single process does all the batching/debatching work.
+* self-ballancing batching.  Bigger batches are cheaper. More backpressure - bigger batches.
+* {message_queue_data, off_heap} for proxies
+* extend the functionality beyond just send to cast/call
+* multi-node cast/call patterns (call_one, call_all_wait etc)
+
+
+
+write a draft as an md file in perf_tests/drafts/astra. Don't use links to local sources (they are not reachable from the internet)
