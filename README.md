@@ -30,6 +30,25 @@ sender N  ─┘                                            └─ receiver N
 
 Node A represents node B by a single `DistEntry`. Every `RemotePid ! Msg` encodes the message and appends it to that entry's output queue under the entry's lock (`dist_entry_out_queue` in `lcnt`). One port task drains the queue into one TCP socket, and one input handler on B parses every signal that arrives. Adding receivers on B adds nothing on A. The send path is in [dist.c](https://github.com/erlang/otp/blob/OTP-27.2.3/erts/emulator/beam/dist.c#L3510-L3606).
 
+Measured on two 48-core hosts over 10 GbE, OTP 27.2.2: N writer processes on node A, one receiver process per writer on node B. Every writer sends 1,000 messages of 225 bytes, sleeping 100 ms between them, so the intended load is N × 10 messages per second and the ideal completion time is 100 seconds for any N. Nothing is dropped; a slow point is a long one.
+
+| writers | intended msg/s | native `!` msg/s | `ecall:send` msg/s | ratio |
+|--------:|---------------:|-----------------:|-------------------:|------:|
+| 10,000 | 100,000 | 99,126 | 99,116 | 1.00 |
+| 20,000 | 200,000 | 198,081 | 197,551 | 1.00 |
+| 30,000 | 300,000 | 294,844 | 293,284 | 0.99 |
+| 40,000 | 400,000 | 224,678 | 395,893 | 1.76 |
+| 50,000 | 500,000 | 211,222 | 483,706 | 2.29 |
+| 60,000 | 600,000 | 208,307 | 593,798 | 2.85 |
+| 80,000 | 800,000 | 219,115 | 753,232 | 3.44 |
+| 100,000 | 1,000,000 | 220,594 | 925,254 | 4.19 |
+| 120,000 | 1,200,000 | 230,180 | 1,137,095 | 4.94 |
+| 150,000 | 1,500,000 | 227,575 | 1,482,131 | 6.51 |
+
+![Send throughput against writer count for native distribution and ecall. Native flattens at about 220,000 messages per second after 30,000 writers; ecall follows the intended pace to 1.48 million messages per second at 150,000 writers.](docs/figures/send-native-vs-ecall.svg)
+
+With plain `!` over distribution, the node delivers what is asked up to 30,000 writers. From 40,000 on, adding senders adds nothing: native throughput stays between 210,000 and 240,000 messages per second all the way to 150,000 writers, and the same fixed workload takes 659 seconds instead of 100. The knee at 30,000 to 40,000 writers is a property of this workload and hardware, not a constant of Erlang. The shape is. That plateau is the core problem ecall solves: with `ecall:send/2` the two paths are indistinguishable below the knee, and above it ecall keeps following the intended pace to the top of the sweep, finishing the same 150 million messages in 101 seconds.
+
 The lock is a plain mutex and stays cheap on its own. What costs is the per-message work around it: every unbatched signal is sized, allocated and encoded by the sender, appended under the lock, and drained by the port task as a separate write. Once the encoded bytes waiting in the queue reach the distribution buffer busy limit (`+zdbbl`, 1 MiB by default), every sender takes the long path: append, see the busy flag, suspend itself, and later be resumed by the port task one by one. With a few processes on a slow link that is sensible flow control. With 100,000 processes the suspend-and-resume cycle becomes the workload.
 
 The usual knobs do not change this:
@@ -38,30 +57,7 @@ The usual knobs do not change this:
 - `process_flag(async_dist, true)` removes the suspension and nothing else. Without flow control memory grows until the VM is killed, which the [documentation](https://www.erlang.org/doc/apps/erts/erlang.html#process_flag_async_dist) warns about.
 - `erpc` is not the problem and not the fix. An `erpc:cast/4` or `erpc:call/4` travels through the same queue as a plain send, as a spawn request that is heavier on both ends.
 
-### Measured: plain distributed send
-
-Two identical hosts: two Xeon Gold 6342 sockets each, 48 cores with hyper-threading off, 251 GiB of RAM, a 10 GbE bond between them, Ubuntu 22.04. Each node runs in a Docker container with host networking from the official `erlang:27.2.2` image, stock emulator, default `+zdbbl 1024`. A third machine drives the runs through Common Test.
-
-Workload: N writer processes on node A, N receiver processes on node B, one receiver per writer. Every writer sends 1,000 messages and sleeps 100 ms between them, so the intended load is N × 10 messages per second and the ideal completion time is 100 seconds for any N. The message is a nested map (three sub-maps of ten atom fields each), 225 bytes on the wire. Nothing is dropped; a slow point is a long one. Throughput is `N × 1000 / elapsed`.
-
-| writers | intended msg/s | measured msg/s | elapsed | peak memory | max run queue | scheduler busy |
-|--------:|---------------:|---------------:|--------:|------------:|--------------:|---------------:|
-| 10,000 | 100,000 | 99,126 | 101 s | 2.2 GB | 454 | 4.6 % |
-| 20,000 | 200,000 | 198,081 | 101 s | 3.7 GB | 3,686 | 6.9 % |
-| 30,000 | 300,000 | 294,844 | 102 s | 9.3 GB | 16,289 | 21.9 % |
-| 40,000 | 400,000 | 224,678 | 178 s | 11.5 GB | 22,304 | 83.7 % |
-| 50,000 | 500,000 | 211,222 | 237 s | 14.6 GB | 25,440 | 88.1 % |
-| 60,000 | 600,000 | 208,307 | 288 s | 15.8 GB | 35,302 | 87.9 % |
-| 80,000 | 800,000 | 219,115 | 365 s | 21.6 GB | 32,983 | 82.8 % |
-| 100,000 | 1,000,000 | 220,594 | 453 s | 24.3 GB | 46,786 | 84.1 % |
-| 120,000 | 1,200,000 | 230,180 | 521 s | 29.9 GB | 63,562 | 82.0 % |
-| 150,000 | 1,500,000 | 227,575 | 659 s | 34.2 GB | 76,206 | 87.0 % |
-
-![Native distributed send throughput against writer count. The line follows the intended pace up to 30,000 writers, drops at 40,000, and stays flat around 220,000 messages per second up to 150,000 writers.](docs/figures/send-native.svg)
-
-Up to 30,000 writers the node delivers what is asked. At 40,000 it delivers less than at 30,000. From there on adding senders adds nothing: throughput sits between 210,000 and 240,000 messages per second all the way to 150,000 writers, while the fixed workload takes 11 minutes instead of 100 seconds, sender memory grows to 34 GB (almost all of it encoded output buffers waiting for the port task, unbounded by the 1 MiB busy limit), and tens of thousands of processes wait in the run queues. Peak memory is `erlang:memory(total)` on the sender; about 2.2 GB of it is the process table for the harness's large `+P` and is present in every point. "Scheduler busy" is the share of scheduler wall time not spent idle and on this path includes time spent blocked in the distribution machinery.
-
-The knee at 30,000 to 40,000 writers is a property of this workload and hardware, not a constant of Erlang. The shape is.
+The full analysis, with lock profiles and everything that was tried, is in [the article](perf_tests/drafts/fabel/article.md).
 
 ## What ecall does
 
@@ -108,26 +104,7 @@ The principles, in the order they matter:
 
 ## Measurements
 
-Same hosts and matrix as above, three operations: `!` against `ecall:send/2`, `erpc:cast/4` against `ecall:cast/4`, and `erpc:call/4` against `ecall:call/4`. ecall ran with the defaults: pool 48, batch cap 1,000, `+zdbbl 1024`. For casts the cast function sends to a counter process on node B, so a point completes only when every cast has executed remotely. For calls each writer waits for its reply before sleeping.
-
-### Send
-
-| writers | native `!` msg/s | `ecall:send` msg/s | ratio |
-|--------:|-----------------:|-------------------:|------:|
-| 10,000 | 99,126 | 99,116 | 1.00 |
-| 20,000 | 198,081 | 197,551 | 1.00 |
-| 30,000 | 294,844 | 293,284 | 0.99 |
-| 40,000 | 224,678 | 395,893 | 1.76 |
-| 50,000 | 211,222 | 483,706 | 2.29 |
-| 60,000 | 208,307 | 593,798 | 2.85 |
-| 80,000 | 219,115 | 753,232 | 3.44 |
-| 100,000 | 220,594 | 925,254 | 4.19 |
-| 120,000 | 230,180 | 1,137,095 | 4.94 |
-| 150,000 | 227,575 | 1,482,131 | 6.51 |
-
-![Send throughput against writer count for native distribution and ecall. Native flattens at about 220,000 messages per second after 30,000 writers; ecall follows the intended pace to 1.48 million messages per second at 150,000 writers.](docs/figures/send-native-vs-ecall.svg)
-
-Below the knee the two paths are indistinguishable. Above it ecall keeps following the intended pace, 98.8 % of it at 150,000 writers, so the test's own pacing was the limit at the top of the sweep. The same 150 million messages took 659 seconds natively and 101 seconds through the pool.
+Same hosts and workload as above for the other two operations: `erpc:cast/4` against `ecall:cast/4` and `erpc:call/4` against `ecall:call/4`. ecall ran with the defaults: pool 48, batch cap 1,000, `+zdbbl 1024`. For casts the cast function sends to a counter process on node B, so a point completes only when every cast has executed remotely. For calls each writer waits for its reply before sleeping.
 
 ### Cast
 
@@ -217,18 +194,11 @@ In your own release put the same `{ecall, [...]}` entry into your `sys.config`.
 
 **`pool_size`** is the number of worker processes in this node's receiver pool. It decides how many proxies every remote node creates for its connection to this node, because a connection has one proxy per remote worker. `undefined` (the default) means `erlang:system_info(logical_processors)` on this node. Read once when `ecall_receive` starts, so a change needs an application restart.
 
-**`batch_size`** is the maximum number of requests a proxy on this node ships in one batch. It is a cap, not a target: a proxy ships whatever is waiting the moment it has anything. The cap bounds the size of a single distribution signal when a proxy resumes after a long suspension. The default of 1000. It is read when a connection is created, so a change applies to connections opened after it (`ecall_connection:disconnect/1` followed by `ecall_connection:connect/1` reopens one).
+**`batch_size`** is the maximum number of requests a proxy on this node ships in one batch. It is a cap, not a target: a proxy ships whatever is waiting the moment it has anything. The cap bounds the size of a single distribution signal when a proxy resumes after a long suspension. The default of 1000. It is read when a connection is created.
 
 ## Node discovery and connections
 
-ecall does not do cluster formation. It relies on Erlang distribution being connected, by `net_adm:ping/1`, `-connect_all`, a cluster library, or whatever you already use. On top of that, nodes that run ecall find each other automatically:
-
-1. `ecall_receive` on every node joins the group `nodes` in the `pg` scope `ecall`. `pg` replicates group membership across all distribution-connected nodes on its own.
-2. `ecall_pg_monitor` subscribes to that group with `pg:monitor/2`. For every member on another node, at startup and on every later `join` event, it calls `ecall_connection:connect(Node)`.
-3. `connect/1` starts a connection process under `ecall_connection_sup`. That process asks the remote `ecall_receive` for its list of workers (10 second timeout), spawns one `off_heap` proxy per remote worker, linked to itself, and registers the connection in a `persistent_term` so that lookups on the send path are lock-free. Both nodes do this independently, so a pair of nodes ends up with a proxy pool in each direction.
-4. On a `leave` event, which `pg` emits when the remote `ecall_receive` stops or the distribution link to that node drops, the monitor calls `ecall_connection:disconnect(Node)`. The connection process and its proxies are terminated, and traffic to that node falls back to the native path until the node rejoins.
-
-A failed connection attempt (for example, the remote receiver did not answer within the timeout) is logged and retried at the next `join` event for that node. If a proxy dies, the connection process dies with it and the supervisor restarts the whole connection.
+ecall does not form the cluster. It relies on Erlang distribution being connected already, by `net_adm:ping/1`, `-connect_all`, a cluster library, or whatever you use. On top of that, nodes running ecall find each other through `pg`: the receiver pool on every node joins the group `nodes` in the `pg` scope `ecall`, and `ecall_pg_monitor` watches that group. When a member appears on another node, ecall opens a connection to it, fetching the remote pool's worker list and spawning one local proxy per remote worker. When the member leaves, because the remote ecall stopped or the distribution link dropped, the connection is closed and traffic to that node falls back to the native path until it rejoins. Each node does this independently, so a pair of nodes has a proxy pool in each direction.
 
 `ecall:connection_info/1` shows the state of a connection from the calling node's point of view:
 
@@ -241,8 +211,6 @@ A failed connection attempt (for example, the remote receiver did not answer wit
 2> ecall:connection_info('unknown@host').
 {error,not_connected}
 ```
-
-Connections can also be managed by hand with `ecall_connection:connect/1` and `ecall_connection:disconnect/1`. The monitor will reopen a connection it sees as a live group member at the next `join` event.
 
 ## API
 
