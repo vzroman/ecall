@@ -1,0 +1,505 @@
+-module(performance_cast_SUITE).
+
+-include_lib("common_test/include/ct.hrl").
+
+%% Common Test API
+-export([
+  all/0,
+  init_per_suite/1,
+  end_per_suite/1
+]).
+
+%% Test cases
+-export([
+  native_test/1,
+  ecall_test/1
+]).
+
+-define(TAG, ?MODULE).
+-define(PAYLOAD_KEY, {?MODULE, payload}).
+
+-record(point, {
+  run_ref,
+  path,
+  receiver_node,
+  payload_profile,
+  writer_count,
+  messages_per_writer,
+  pace_ms,
+  expected,
+  metadata = #{}
+}).
+
+-record(writer, {
+  run_ref,
+  path,
+  receiver_node,
+  target,
+  messages_per_writer,
+  pace_ms
+}).
+
+-record(state, {
+  point,
+  target_pids = [],
+  target_mons = #{},
+  targets_ready = 0,
+  targets_done = 0,
+  target_count = 0,
+  writer_pids = [],
+  ready = 0,
+  writer_completed = 0,
+  writer_down = 0,
+  completed = 0,
+  metrics
+}).
+
+
+%%====================================================================
+%% Common Test API
+%%====================================================================
+
+all() ->
+  [native_test, ecall_test].
+
+init_per_suite(Config) ->
+  Performance = performance_settings(),
+  RoleConfig = role_config(),
+  [SenderNode, ReceiverNode] =
+    distributed_tests_utils:start_nodes(node_configs(RoleConfig)),
+  [
+    {performance_nodes, [SenderNode, ReceiverNode]},
+    {sender_node, SenderNode},
+    {receiver_node, ReceiverNode},
+    {performance, Performance}
+    | Config
+  ].
+
+end_per_suite(Config) ->
+  distributed_tests_utils:stop_nodes(?config(performance_nodes, Config)).
+
+
+%%====================================================================
+%% Test cases
+%%====================================================================
+
+native_test(Config) ->
+  _ = ct:timetrap(infinity),
+  run_payloads(native, Config).
+
+ecall_test(Config) ->
+  _ = ct:timetrap(infinity),
+  run_payloads(ecall, Config).
+
+
+%%====================================================================
+%% Test matrix
+%%====================================================================
+
+run_payloads(Path, Config) ->
+  Performance = ?config(performance, Config),
+  [
+    run_writer_counts(Path, PayloadProfile, Config)
+    || PayloadProfile <- maps:get(payloads, Performance)
+  ],
+  ok.
+
+run_writer_counts(Path, PayloadProfile, Config) ->
+  Performance = ?config(performance, Config),
+  [
+    test_point(Path, PayloadProfile, WriterCount, Config)
+    || WriterCount <- maps:get(writer_counts, Performance)
+  ],
+  ok.
+
+test_point(native, PayloadProfile, WriterCount, Config) ->
+  native_test_point(PayloadProfile, WriterCount, Config);
+test_point(ecall, PayloadProfile, WriterCount, Config) ->
+  ecall_test_point(PayloadProfile, WriterCount, Config).
+
+native_test_point(PayloadProfile, WriterCount, Config) ->
+  run_cast_test_point(native, PayloadProfile, WriterCount, Config).
+
+ecall_test_point(PayloadProfile, WriterCount, Config) ->
+  run_cast_test_point(ecall, PayloadProfile, WriterCount, Config).
+
+run_cast_test_point(Path, PayloadProfile, WriterCount, Config) ->
+  Performance = ?config(performance, Config),
+  PointConfig = #{
+    path => Path,
+    receiver_node => ?config(receiver_node, Config),
+    payload_profile => PayloadProfile,
+    writer_count => WriterCount,
+    messages_per_writer => maps:get(messages_per_writer, Performance),
+    pace_ms => maps:get(pace_ms, Performance),
+    metadata => point_metadata(Path)
+  },
+  Result =
+    run_on_sender(
+      ?config(sender_node, Config),
+      fun() -> run_cast_point(PointConfig) end),
+  ok = performance_metrics:point(Config, Result).
+
+point_metadata(native) ->
+  #{};
+point_metadata(ecall) ->
+  #{}.
+
+
+%%====================================================================
+%% Point runner
+%%====================================================================
+
+run_cast_point(Config) ->
+  Point = cast_point(Config),
+  persistent_term:put(
+    ?PAYLOAD_KEY,
+    performance_payloads:new(Point#point.payload_profile)),
+  try
+    State0 = start_participants(Point),
+    try
+      State1 = await_ready(State0),
+      Metrics = performance_metrics:start(Point#point.receiver_node),
+      try
+        ok = performance_metrics:begin_point(Metrics),
+        StartedAt = erlang:monotonic_time(millisecond),
+        release_writers(State1),
+        State2 = await_completion(State1#state{metrics = Metrics}),
+        ElapsedMs = erlang:monotonic_time(millisecond) - StartedAt,
+        MetricResults = performance_metrics:finish(Metrics),
+        ok = stop_target(State2),
+        result_map(Point, ElapsedMs, MetricResults)
+      after
+        performance_metrics:abort(Metrics)
+      end
+    catch
+      Class:Reason:Stack ->
+        cleanup_point(State0),
+        erlang:raise(Class, Reason, Stack)
+    end
+  after
+    persistent_term:erase(?PAYLOAD_KEY)
+  end.
+
+cast_point(Config) ->
+  WriterCount = maps:get(writer_count, Config),
+  MessagesPerWriter = maps:get(messages_per_writer, Config),
+  #point{
+    run_ref = make_ref(),
+    path = maps:get(path, Config),
+    receiver_node = maps:get(receiver_node, Config),
+    payload_profile = maps:get(payload_profile, Config),
+    writer_count = WriterCount,
+    messages_per_writer = MessagesPerWriter,
+    pace_ms = maps:get(pace_ms, Config),
+    expected = WriterCount * MessagesPerWriter,
+    metadata = maps:get(metadata, Config, #{})
+  }.
+
+start_participants(Point) ->
+  Targets = start_cast_counters(Point),
+  TargetMons = monitor_targets(Targets),
+  Writer = #writer{
+    run_ref = Point#point.run_ref,
+    path = Point#point.path,
+    receiver_node = Point#point.receiver_node,
+    messages_per_writer = Point#point.messages_per_writer,
+    pace_ms = Point#point.pace_ms
+  },
+  WriterPids = start_writers(Targets, Writer),
+  #state{
+    point = Point,
+    target_pids = Targets,
+    target_mons = TargetMons,
+    writer_pids = WriterPids
+  }.
+
+start_cast_counters(#point{
+    writer_count = WriterCount} = Point) ->
+  start_cast_counters(WriterCount, Point, []).
+
+start_cast_counters(0, _Point, Targets) ->
+  Targets;
+start_cast_counters(Count, Point, Targets) when Count > 0 ->
+  Target = start_cast_counter(Point),
+  start_cast_counters(Count - 1, Point, [Target | Targets]).
+
+start_cast_counter(#point{
+    run_ref = RunRef,
+    receiver_node = Node,
+    messages_per_writer = Expected}) ->
+  Coordinator = self(),
+  spawn_opt(
+    Node,
+    fun() ->
+      Coordinator ! {?TAG, RunRef, target_ready, self()},
+      cast_counter_loop(RunRef, Coordinator, Expected, 0)
+    end,
+    [{message_queue_data, off_heap}]).
+
+monitor_targets(Targets) ->
+  maps:from_list([
+    {Target, erlang:monitor(process, Target)}
+    || Target <- Targets
+  ]).
+
+start_writers(Targets, Writer) ->
+  start_writers(Targets, Writer, self(), []).
+
+start_writers([], _Writer, _Coordinator, Acc) ->
+  Acc;
+start_writers([Target | Rest], Writer, Coordinator, Acc) ->
+  Writer1 = Writer#writer{target = Target},
+  {Pid, _Mon} = spawn_monitor(fun() -> writer_loop(Writer1, Coordinator) end),
+  start_writers(Rest, Writer, Coordinator, [Pid | Acc]).
+
+await_ready(#state{
+    point = #point{writer_count = WriterCount},
+    ready = WriterCount,
+    targets_ready = WriterCount} = State) ->
+  State;
+await_ready(State) ->
+  receive
+    Message ->
+      await_ready(handle_ready_message(Message, State))
+  end.
+
+handle_ready_message({?TAG, RunRef, target_ready, Target}, State)
+    when RunRef =:= (State#state.point)#point.run_ref,
+         is_map_key(Target, State#state.target_mons) ->
+  State#state{targets_ready = State#state.targets_ready + 1};
+handle_ready_message({?TAG, RunRef, writer_ready, _Pid}, State)
+    when RunRef =:= (State#state.point)#point.run_ref ->
+  State#state{ready = State#state.ready + 1};
+handle_ready_message({'DOWN', _Mon, process, Pid, Reason}, _State) ->
+  exit({process_down_before_ready, Pid, Reason});
+handle_ready_message(Message, _State) ->
+  exit({unexpected_ready_message, Message}).
+
+release_writers(#state{
+    point = #point{run_ref = RunRef},
+    writer_pids = WriterPids}) ->
+  [Pid ! {?TAG, RunRef, start} || Pid <- WriterPids],
+  ok.
+
+await_completion(#state{
+    point = #point{writer_count = WriterCount, expected = Expected},
+    writer_completed = WriterCount,
+    writer_down = WriterCount,
+    targets_done = WriterCount,
+    target_count = Expected,
+    completed = Expected} = State) ->
+  State;
+await_completion(State) ->
+  receive
+    Message ->
+      await_completion(handle_completion_message(Message, State))
+  end.
+
+handle_completion_message({?TAG, RunRef, target_completed, Target, Count}, State)
+    when RunRef =:= (State#state.point)#point.run_ref,
+         is_map_key(Target, State#state.target_mons) ->
+  Count = (State#state.point)#point.messages_per_writer,
+  State#state{
+    targets_done = State#state.targets_done + 1,
+    target_count = State#state.target_count + Count
+  };
+handle_completion_message({?TAG, RunRef, writer_completed, _Pid, Count}, State)
+    when RunRef =:= (State#state.point)#point.run_ref ->
+  Count = (State#state.point)#point.messages_per_writer,
+  State#state{
+    writer_completed = State#state.writer_completed + 1,
+    completed = State#state.completed + Count
+  };
+handle_completion_message({'DOWN', _Mon, process, _Pid, _Reason} = Message, State) ->
+  case performance_metrics:handle_down(Message, State#state.metrics) of
+    not_collector ->
+      handle_participant_down(Message, State)
+  end;
+handle_completion_message(Message, _State) ->
+  exit({unexpected_completion_message, Message}).
+
+handle_participant_down({'DOWN', Mon, process, Pid, normal}, State) ->
+  case maps:find(Pid, State#state.target_mons) of
+    {ok, Mon} ->
+      exit({target_down_before_stop, Pid});
+    error ->
+      State#state{writer_down = State#state.writer_down + 1}
+  end;
+handle_participant_down({'DOWN', _Mon, process, Pid, Reason}, _State) ->
+  exit({process_failed, Pid, Reason}).
+
+
+%%====================================================================
+%% Writers and target
+%%====================================================================
+
+writer_loop(Writer, Coordinator) ->
+  RunRef = Writer#writer.run_ref,
+  Coordinator ! {?TAG, RunRef, writer_ready, self()},
+  receive
+    {?TAG, RunRef, start} ->
+      Completed = writer_operations(1, 0, Writer),
+      Coordinator ! {?TAG, RunRef, writer_completed, self(), Completed};
+    Message ->
+      exit({unexpected_writer_message, Message})
+  end.
+
+writer_operations(Seq, Completed, #writer{messages_per_writer = Max})
+    when Seq > Max ->
+  Completed;
+writer_operations(Seq, Completed, Writer)
+    when Seq =:= Writer#writer.messages_per_writer ->
+  ok = cast_operation(Writer),
+  writer_operations(Seq + 1, Completed + 1, Writer);
+writer_operations(
+    Seq,
+    Completed,
+    #writer{pace_ms = PaceMs} = Writer) ->
+  StartedAt = erlang:monotonic_time(millisecond),
+  ok = cast_operation(Writer),
+  ok = sleep_remaining_pace(PaceMs, StartedAt),
+  writer_operations(Seq + 1, Completed + 1, Writer).
+
+sleep_remaining_pace(PaceMs, StartedAt) ->
+  ElapsedMs = erlang:monotonic_time(millisecond) - StartedAt,
+  timer:sleep(erlang:max(PaceMs - ElapsedMs, 0)).
+
+cast_operation(#writer{
+    path = native,
+    receiver_node = Node,
+    target = Target,
+    run_ref = RunRef}) ->
+  Payload = persistent_term:get(?PAYLOAD_KEY),
+  Message = {?TAG, RunRef, cast_payload, Payload},
+  ok = erpc:cast(Node, erlang, send, [Target, Message]);
+cast_operation(#writer{
+    path = ecall,
+    receiver_node = Node,
+    target = Target,
+    run_ref = RunRef}) ->
+  Payload = persistent_term:get(?PAYLOAD_KEY),
+  Message = {?TAG, RunRef, cast_payload, Payload},
+  ok = ecall:cast(Node, erlang, send, [Target, Message]).
+
+cast_counter_loop(RunRef, Coordinator, Expected, Count) ->
+  receive
+    {?TAG, RunRef, stop, From} ->
+      From ! {?TAG, RunRef, target_stopped, self(), Count},
+      ok;
+    {?TAG, RunRef, cast_payload, _Payload} ->
+      Count1 = Count + 1,
+      case Count1 of
+        Expected ->
+          Coordinator ! {?TAG, RunRef, target_completed, self(), Count1},
+          cast_counter_loop(RunRef, Coordinator, Expected, Count1);
+        _ when Count1 < Expected ->
+          cast_counter_loop(RunRef, Coordinator, Expected, Count1);
+        _ ->
+          exit({too_many_casts, Count1, Expected})
+      end;
+    Message ->
+      exit({unexpected_cast_message, Message})
+  end.
+
+
+%%====================================================================
+%% Cleanup and reporting
+%%====================================================================
+
+stop_target(#state{
+    point = #point{run_ref = RunRef},
+    target_pids = Targets,
+    target_mons = TargetMons}) ->
+  [Target ! {?TAG, RunRef, stop, self()} || Target <- Targets],
+  wait_targets_stopped(RunRef, TargetMons, TargetMons).
+
+wait_targets_stopped(_RunRef, Empty, Empty) when map_size(Empty) =:= 0 ->
+  ok;
+wait_targets_stopped(RunRef, PendingAcks, PendingDowns) ->
+  receive
+    {?TAG, RunRef, target_stopped, Target, _Count} ->
+      true = is_map_key(Target, PendingAcks),
+      wait_targets_stopped(
+        RunRef,
+        maps:remove(Target, PendingAcks),
+        PendingDowns);
+    {'DOWN', TargetMon, process, Target, normal} ->
+      TargetMon = maps:get(Target, PendingDowns),
+      wait_targets_stopped(
+        RunRef,
+        PendingAcks,
+        maps:remove(Target, PendingDowns));
+    Message ->
+      exit({unexpected_stop_message, Message})
+  end.
+
+cleanup_point(#state{target_pids = Targets, target_mons = TargetMons,
+                     writer_pids = WriterPids}) ->
+  [exit(Pid, kill) || Pid <- WriterPids],
+  [exit(Target, kill) || Target <- Targets],
+  [erlang:demonitor(TargetMon, [flush]) || TargetMon <- maps:values(TargetMons)],
+  ok.
+
+result_map(Point, ElapsedMs, Metrics) ->
+  Base = #{
+    suite => ?MODULE,
+    operation => cast,
+    path => Point#point.path,
+    receiver_node => Point#point.receiver_node,
+    payload => Point#point.payload_profile,
+    writer_count => Point#point.writer_count,
+    messages_per_writer => Point#point.messages_per_writer,
+    pace_ms => Point#point.pace_ms,
+    elapsed_ms => ElapsedMs,
+    metrics => Metrics
+  },
+  maps:merge(Base, Point#point.metadata).
+
+
+%%====================================================================
+%% Suite setup helpers
+%%====================================================================
+
+performance_settings() ->
+  maps:merge(default_performance_settings(), ct:get_config(performance, #{})).
+
+default_performance_settings() ->
+  #{
+    pace_ms => 100,
+    messages_per_writer => 1000,
+    writer_counts => [1000, 10000, 100000, 500000, 1000000],
+    payloads => [tiny, data, binary_10kib, binary_100kib, binary_1mib]
+  }.
+
+role_config() ->
+  ct:get_config(role_config, #{sender => local, receiver => local}).
+
+node_configs(RoleConfig) ->
+  [
+    node_config(sender, maps:get(sender, RoleConfig, local)),
+    node_config(receiver, maps:get(receiver, RoleConfig, local))
+  ].
+
+node_config(Name, Location) ->
+  #{
+    name => Name,
+    location => Location
+  }.
+
+run_on_sender(SenderNode, Fun) ->
+  Controller = self(),
+  Ref = make_ref(),
+  {Pid, Mon} =
+    spawn_monitor(
+      SenderNode,
+      fun() ->
+        Controller ! {?TAG, Ref, self(), Fun()}
+      end),
+  receive
+    {?TAG, Ref, Pid, Result} ->
+      erlang:demonitor(Mon, [flush]),
+      Result;
+    {'DOWN', Mon, process, Pid, Reason} ->
+      exit({sender_point_failed, Reason})
+  end.

@@ -42,7 +42,7 @@ start_connection( Node )->
     {ok,_}-> ok;
     {ok, _, _}-> ok;
     {error, already_present}->ok;
-    {already_started, _}->ok;
+    {error, {already_started, _Pid}}->ok;
     {error,Error} -> throw(Error)
   end.
 
@@ -50,5 +50,3 @@ stop_connection( Node )->
   supervisor:terminate_child(?MODULE, Node),
   supervisor:delete_child( ?MODULE, Node),
   ok.
-
-
