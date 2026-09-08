@@ -194,7 +194,7 @@ In your own release put the same `{ecall, [...]}` entry into your `sys.config`.
 
 **`pool_size`** is the number of worker processes in this node's receiver pool. It decides how many proxies every remote node creates for its connection to this node, because a connection has one proxy per remote worker. `undefined` (the default) means `erlang:system_info(logical_processors)` on this node. Read once when `ecall_receive` starts, so a change needs an application restart.
 
-**`batch_size`** is the maximum number of requests a proxy on this node ships in one batch. It is a cap, not a target: a proxy ships whatever is waiting the moment it has anything. The cap bounds the size of a single distribution signal when a proxy resumes after a long suspension. The default of 1000. It is read when a connection is created.
+**`batch_size`** is the maximum number of requests a proxy on this node ships in one batch. It is a cap, not a target: a proxy ships whatever is waiting the moment it has anything. The cap bounds the size of a single distribution signal when a proxy resumes after a long suspension. The default is 1000. It is read when a connection is created.
 
 ## Node discovery and connections
 
@@ -246,14 +246,14 @@ Replaces `erpc:call/4`. The remote worker spawns a process that runs `apply(Modu
 - If the function returns `{error, Reason}`, the call returns that `{error, Reason}` unchanged. Any other return value `Value` is wrapped as `{ok, Value}`.
 - If the function raises, the call returns `{error, {exit, Reason}}`.
 - If the connection to the node goes down while the call is in flight, the call returns `{error, {badrpc, Reason}}`. The caller monitors its proxy, and proxies die with the connection, so a call cannot hang on a dead node.
-- With no connection, `erpc:call/4` is used and its exceptions are mapped to the same shapes.
+- With no connection, `erpc:call/4` is used and its error and exit exceptions are mapped to the same shapes; a `throw` comes back as `{error, Thrown}` on that path instead of `{error, {exit, Thrown}}`.
 
 There is no timeout argument. A call waits until the function returns or the connection goes down, which is the behaviour of `erpc:call/4` with the default `infinity`.
 
 ```erlang
 {ok, 42} = ecall:call('node_b@host', my_counter, value, [Key]),
 {error, not_found} = ecall:call('node_b@host', my_index, lookup, [MissingKey]),
-{error, {exit, {badarith, _}}} = ecall:call('node_b@host', erlang, '/', [1, 0]).
+{error, {exit, badarith}} = ecall:call('node_b@host', erlang, '/', [1, 0]).
 ```
 
 Note that a function returning `{ok, X}` produces `{ok, {ok, X}}`. The convention throughout ecall is that `{error, _}` means rejection and everything else means success.
@@ -356,12 +356,11 @@ Reports whether this node has an ecall connection to `Node`, and its proxy count
 
 - **Ordering is preserved per caller.** A caller always maps to the same proxy, a proxy emits batches in order, and the worker replays each batch in order. That is exactly Erlang's own guarantee: nothing is promised about the interleaving of different callers, and cast and call bodies run in independent processes with no ordering at all.
 - **Backpressure moves.** A native remote send suspends the caller when the channel is busy. `ecall:send/2` and `ecall:cast/4` return as soon as the request is in a proxy's mailbox. The proxies are flow-controlled by the distribution layer; the callers are not. Under sustained overload with no application-level admission control, proxy mailboxes grow without bound. ecall raises the ceiling by an order of magnitude and gives you a place to put the policy; it does not remove the need for one.
-- **Failure semantics match the native operations.** Send and cast are fire-and-forget on both paths. A call is protected by a monitor on its proxy and fails with `{badrpc, Reason}` when the connection goes down.
+- **Failure semantics match the native operations.** Send and cast are fire-and-forget on both paths. A call is protected by a monitor on its proxy and fails with `{error, {badrpc, Reason}}` when the connection goes down.
 
 ## Tests
 
 ```sh
-make test               # unit suite: routing, connection lifecycle, batch sizing
 make performance_tests  # distributed suites; see test/performance/ for the Docker setup
 ```
 
