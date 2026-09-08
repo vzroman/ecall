@@ -168,7 +168,7 @@ The distribution queue is entered once per batch instead of once per message. A 
 
 One batching process is a new single point, on both ends: one process collecting and encoding batches, one process decoding them and doing the local deliveries. A pool spreads that work over the cores. The receiver pool defaults to `erlang:system_info(logical_processors)` on the receiving node, 48 on our hosts, and a connection creates one local proxy per remote worker. Callers are sharded onto proxies by pid, so the whole pool works in parallel with no coordination between its members.
 
-We swept the pool size in an earlier series of runs on the same hosts, up to 400,000 writers. A pool of one never stalled but saturated badly: 14 % of the intended pace and 69 GB of sender memory at 400,000 writers. A pool of 8 held to about 150,000 writers and fell off after that. Pools of 24 and 48 were flat across the whole range. There is a trade-off: more proxies means more contenders on the distribution lock, fewer means more contention on each proxy's mailbox. On a 48-core box anything in the tens works.
+We swept the pool size in an earlier series of runs on the same hosts, up to 400,000 writers. A pool of one never stalled but saturated badly: 14 % of the intended pace and 69 GB of sender memory at 400,000 writers. A pool of 8 held to about 150,000 writers and fell off after that. Pools of 24 and 48 were flat across the whole range. 
 
 ### 3. Self-balancing batching: bigger batches are cheaper, and more backpressure makes bigger batches
 
@@ -230,7 +230,7 @@ A called function returns `{ok, Result}` or `{error, Reason}`; the group functio
 
 ## The numbers
 
-Same hosts, same matrix, three operations measured in September 2026: `!` against `ecall:send/2`, `erpc:cast/4` against `ecall:cast/4`, and `erpc:call/4` against `ecall:call/4`. The ecall path ran with the defaults: a pool of 48, batch cap 1,000, `+zdbbl 1024`. For casts, the cast function is `erlang:send` to a counter process on node B, so a point completes only when every cast has executed remotely. For calls, each writer waits for its reply before sleeping, so a slow reply stretches that writer's cycle. Elapsed for cast and call is wall time from releasing the writers to verified completion.
+Same hosts, same matrix, three operations: `!` against `ecall:send/2`, `erpc:cast/4` against `ecall:cast/4`, and `erpc:call/4` against `ecall:call/4`. The ecall path ran with the defaults: a pool of 48, batch cap 1,000, `+zdbbl 1024`. For casts, the cast function is `erlang:send` to a counter process on node B, so a point completes only when every cast has executed remotely. For calls, each writer waits for its reply before sleeping, so a slow reply stretches that writer's cycle. Elapsed for cast and call is wall time from releasing the writers to verified completion.
 
 Send:
 
