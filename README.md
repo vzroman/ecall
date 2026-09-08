@@ -200,35 +200,6 @@ ecall is an OTP application. The proper way to start it is to list it in your ap
 ]}.
 ```
 
-Starting the application runs `ecall_sup`, which supervises four children with a `one_for_one` strategy:
-
-| child | role |
-|---|---|
-| `pg` scope `ecall` | the process-group scope used for node discovery |
-| `ecall_receive` | the receiver pool on this node; joins the `pg` group |
-| `ecall_connection_sup` | a supervisor holding one connection process per remote node |
-| `ecall_pg_monitor` | watches the `pg` group and opens or closes connections as nodes come and go |
-
-If you would rather embed ecall in your own supervision tree, for example in an embedded release with a single top supervisor, add `ecall_sup` as a supervisor child and load the application beforehand so that its environment is available:
-
-```erlang
-init([]) ->
-  ok = application:load(ecall),
-  Ecall = #{
-    id => ecall_sup,
-    start => {ecall_sup, start_link, []},
-    restart => permanent,
-    shutdown => infinity,
-    type => supervisor,
-    modules => [ecall_sup]
-  },
-  {ok, {#{strategy => one_for_one, intensity => 10, period => 1000}, [Ecall]}}.
-```
-
-Do not start it both ways, and do not start a `pg` scope named `ecall` yourself: `ecall_sup` owns it.
-
-The repository also builds as a stand-alone release for the test suites (`./rebar3 shell` through `make shell` picks up [config/vm.args](config/vm.args) and [config/sys.config](config/sys.config)). That is not needed to use ecall as a library.
-
 ## Configuration
 
 ecall reads two parameters from its application environment. In this repository they live in [config/apps/ecall.config](config/apps/ecall.config), which [config/sys.config](config/sys.config) includes:
@@ -246,11 +217,7 @@ In your own release put the same `{ecall, [...]}` entry into your `sys.config`.
 
 **`pool_size`** is the number of worker processes in this node's receiver pool. It decides how many proxies every remote node creates for its connection to this node, because a connection has one proxy per remote worker. `undefined` (the default) means `erlang:system_info(logical_processors)` on this node. Read once when `ecall_receive` starts, so a change needs an application restart.
 
-The pool-size table above is the tuning evidence. On a 48-core host a pool of 24 or 48 was flat up to 400,000 senders, a pool of 8 fell off after 150,000, and a pool of 1 saturated at 100,000. More workers means more contenders on the distribution lock, fewer means more contention on each proxy's mailbox. Leaving it at the default, one worker per logical processor, is the right choice on hosts of any size that have been measured. Lower it only when the receiving node has many cores and you want to cap the number of processes a large cluster creates: with a pool of P and a cluster of N nodes, every node runs P receiver workers and (N − 1) × P proxies.
-
-**`batch_size`** is the maximum number of requests a proxy on this node ships in one batch. It is a cap, not a target: a proxy ships whatever is waiting the moment it has anything, and in the runs above batches never exceeded about 20 messages at 150,000 senders. The cap bounds the size of a single distribution signal when a proxy resumes after a long suspension. The default of 1000 is far above any measured operating point. It is read when a connection is created, so a change applies to connections opened after it (`ecall_connection:disconnect/1` followed by `ecall_connection:connect/1` reopens one).
-
-**`+zdbbl`** is deliberately left at the emulator default of 1024 KiB on the pooled path. The busy limit is what turns backpressure into bigger batches. Raising it in earlier runs made the batches smaller and the memory larger without adding throughput.
+**`batch_size`** is the maximum number of requests a proxy on this node ships in one batch. It is a cap, not a target: a proxy ships whatever is waiting the moment it has anything. The cap bounds the size of a single distribution signal when a proxy resumes after a long suspension. The default of 1000. It is read when a connection is created, so a change applies to connections opened after it (`ecall_connection:disconnect/1` followed by `ecall_connection:connect/1` reopens one).
 
 ## Node discovery and connections
 
@@ -422,8 +389,6 @@ Reports whether this node has an ecall connection to `Node`, and its proxy count
 - **Ordering is preserved per caller.** A caller always maps to the same proxy, a proxy emits batches in order, and the worker replays each batch in order. That is exactly Erlang's own guarantee: nothing is promised about the interleaving of different callers, and cast and call bodies run in independent processes with no ordering at all.
 - **Backpressure moves.** A native remote send suspends the caller when the channel is busy. `ecall:send/2` and `ecall:cast/4` return as soon as the request is in a proxy's mailbox. The proxies are flow-controlled by the distribution layer; the callers are not. Under sustained overload with no application-level admission control, proxy mailboxes grow without bound. ecall raises the ceiling by an order of magnitude and gives you a place to put the policy; it does not remove the need for one.
 - **Failure semantics match the native operations.** Send and cast are fire-and-forget on both paths. A call is protected by a monitor on its proxy and fails with `{badrpc, Reason}` when the connection goes down.
-- **One extra hop each way.** Two extra scheduling events and one local copy per message. Invisible above the saturation point, measurable below it: at 10,000 writers the call path shows slightly higher scheduler utilization through ecall than through `erpc`.
-- **Measurement limits.** One run per point, one 225-byte payload, no large binaries, sender-side metrics only. The intended rates are demand targets, not a fixed arrival rate, because the pacing loop stretches when an operation is slow.
 
 ## Tests
 
