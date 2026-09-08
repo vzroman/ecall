@@ -1,110 +1,439 @@
 # ecall
 
-Erlang library for group remote calls and casts.
+Pooled, batched transport for Erlang distribution, with `send`, `cast` and `call` on top of it and a set of multi-node call and cast patterns (`call_one`, `call_any`, `call_all`, `call_all_wait`, `cast_one`, `cast_all`).
 
-I tried to keep API as simple as possible.
+- [The problem](#the-problem)
+- [What ecall does](#what-ecall-does)
+- [Measurements](#measurements)
+- [Installation and startup](#installation-and-startup)
+- [Configuration](#configuration)
+- [Node discovery and connections](#node-discovery-and-connections)
+- [API](#api)
+- [Semantics and limits](#semantics-and-limits)
+- [Tests](#tests)
 
-I appreciate any pull requests for bug fixing, tests or extending the functionality.
+## The problem
 
-CASTS
------
-    Casts always return ok and do not wait for results. So they are the fastest.
-    
-    ----------------cast_one----------------------------------
-    If you want to cast any random node from Nodes call:
+OTP 25 fixed the many-to-one problem inside a node: many senders to one process used to serialize on the receiver's signal-queue lock, and the [parallel signal sending optimization](https://www.erlang.org/blog/parallel-signal-sending-optimization/) spread them over 64 buffers for `off_heap` processes.
 
-    ok = ecall:cast_one(Nodes, Module, Function, Arguments )
-    
-    and at the choosed node Module:Function(...Arguments ) I mean Module:Function(A1,A2,...)  
-    will be applied
+Move the receivers to another node and a different single point takes over. Take N processes on node A, each sending to its own process on node B. At the application level there is no shared mailbox. At the transport level there is exactly one:
 
-    ----------------cast_all----------------------------------
-    If you want to cast all nodes from Nodes call:
+```text
+node A                                                     node B
 
-    ok = ecall:cast_all(Nodes, Module, Function, Arguments )
+sender 1  ─┐                                            ┌─ receiver 1
+sender 2  ─┤   one DistEntry, one output queue,         ├─ receiver 2
+sender 3  ─┼─► one lock (dep->qlock), one port task ──► ┼─ receiver 3
+   ...     │   one TCP socket, one input handler        │    ...
+sender N  ─┘                                            └─ receiver N
+```
 
-CALLS
------
-    Calls are a bit more complicated. Calls wait for reply. 
-    
-    Called Module:Function( ...Arguments ) has to reply either:
+Node A represents node B by a single `DistEntry`. Every `RemotePid ! Msg` encodes the message and appends it to that entry's output queue under the entry's lock (`dist_entry_out_queue` in `lcnt`). One port task drains the queue into one TCP socket, and one input handler on B parses every signal that arrives. Adding receivers on B adds nothing on A. The send path is in [dist.c](https://github.com/erlang/otp/blob/OTP-27.2.3/erts/emulator/beam/dist.c#L3510-L3606).
 
-    { ok, Result }  or {error, Error}
+The lock is a plain mutex and stays cheap on its own. What costs is the per-message work around it: every unbatched signal is sized, allocated and encoded by the sender, appended under the lock, and drained by the port task as a separate write. Once the encoded bytes waiting in the queue reach the distribution buffer busy limit (`+zdbbl`, 1 MiB by default), every sender takes the long path: append, see the busy flag, suspend itself, and later be resumed by the port task one by one. With a few processes on a slow link that is sensible flow control. With 100,000 processes the suspend-and-resume cycle becomes the workload.
 
-    ----------------call_one----------------------------------
-    Use this policy if it is enough if at least one node From nodes replied {ok, Result}
+The usual knobs do not change this:
 
-    {ok, {Node,Result}} | {error, NodesErrors} = 
-        ecall:call_one(Nodes, Module, Function, Arguments )
-    
-    The algorithm takes one random node from Nodes and calls it with Module:Function( ...Arguments )
-    If the node replied with {ok, Result} it's returned to you. 
-    If the node replied with {error, Error} this node is exluded from the Nodes 
-    and the next random node is called and so on until {ok, Result} or
-    no one left. If none was ok then the list of errors is return to you as:
-        
-    {error, [{node1,Error1}, {node2,Error1}|_AndSoOn] }
-    
-    There is one more thing. The call to a node can return {badrpc, Result}. 
-    It means that the node either not alive or the 
-    Module:Function( Arguments ) crashed. 
-    If you want to be aware of it call with _RpcErr = true:
-    
-    {ok, Result} | {error, NodesErrors} = 
-        ecall:call_one(Nodes, Module, Function, Arguments, _RpcErr = true )
-    
-    then if the node didn't replied his error will look like {badrpc, Reason}
+- Raising `+zdbbl` changes the shape of the overload, not its size. The node alternates between long quiet stretches with every sender suspended and bursts where all of them wake at once. Throughput ends up the same, memory higher.
+- `process_flag(async_dist, true)` removes the suspension and nothing else. Without flow control memory grows until the VM is killed, which the [documentation](https://www.erlang.org/doc/apps/erts/erlang.html#process_flag_async_dist) warns about.
+- `erpc` is not the problem and not the fix. An `erpc:cast/4` or `erpc:call/4` travels through the same queue as a plain send, as a spawn request that is heavier on both ends.
 
-    ----------------call_any----------------------------------
-    This policy is almost the same as call one but with one usefull difference. 
-    All the Nodes are called at the same time.
-    It means the algoritm doesn't wait for reply from the node and calls the next and next...
-    then it waits for at least one {ok. Result} if it comes it's returned to you others are ignored
-    If no one replied ok then the {error, NodesErrors} is returned to you the same as in call_one 
-    Don't forget set _RpcErr = true if you are interested in badrpc errors:
+### Measured: plain distributed send
 
-    {ok,{Node,Result}} | {error, NodesErrors} = ecall:call_any(Nodes, Module, Function, Arguments )
+Two identical hosts: two Xeon Gold 6342 sockets each, 48 cores with hyper-threading off, 251 GiB of RAM, a 10 GbE bond between them, Ubuntu 22.04. Each node runs in a Docker container with host networking from the official `erlang:27.2.2` image, stock emulator, default `+zdbbl 1024`. A third machine drives the runs through Common Test.
 
-    ----------------call_all----------------------------------
-    This is the most strict policy. The {ok,NodesResults} will be returned to you
-    only if all the Nodes replied with {ok,Result}. If at least one replied with {error,Error} then
-    {error,{Node,Error}} is returned
+Workload: N writer processes on node A, N receiver processes on node B, one receiver per writer. Every writer sends 1,000 messages and sleeps 100 ms between them, so the intended load is N × 10 messages per second and the ideal completion time is 100 seconds for any N. The message is a nested map (three sub-maps of ten atom fields each), 225 bytes on the wire. Nothing is dropped; a slow point is a long one. Throughput is `N × 1000 / elapsed`.
 
-    {ok,[{Node1,Result1},{Node2,Result2} | _AndSoOn]} | {error, {Node,Error}} = 
-        ecall:call_all(Nodes, Module, Function, Arguments )
+| writers | intended msg/s | measured msg/s | elapsed | peak memory | max run queue | scheduler busy |
+|--------:|---------------:|---------------:|--------:|------------:|--------------:|---------------:|
+| 10,000 | 100,000 | 99,126 | 101 s | 2.2 GB | 454 | 4.6 % |
+| 20,000 | 200,000 | 198,081 | 101 s | 3.7 GB | 3,686 | 6.9 % |
+| 30,000 | 300,000 | 294,844 | 102 s | 9.3 GB | 16,289 | 21.9 % |
+| 40,000 | 400,000 | 224,678 | 178 s | 11.5 GB | 22,304 | 83.7 % |
+| 50,000 | 500,000 | 211,222 | 237 s | 14.6 GB | 25,440 | 88.1 % |
+| 60,000 | 600,000 | 208,307 | 288 s | 15.8 GB | 35,302 | 87.9 % |
+| 80,000 | 800,000 | 219,115 | 365 s | 21.6 GB | 32,983 | 82.8 % |
+| 100,000 | 1,000,000 | 220,594 | 453 s | 24.3 GB | 46,786 | 84.1 % |
+| 120,000 | 1,200,000 | 230,180 | 521 s | 29.9 GB | 63,562 | 82.0 % |
+| 150,000 | 1,500,000 | 227,575 | 659 s | 34.2 GB | 76,206 | 87.0 % |
 
-    ----------------call_all wait----------------------------------
-    This is the slowest policy but for some needs useful. 
-    If you ask:
-        
-    {Replies, Rejects} = ecall:call_all_wait(Nodes, Module, Function, Arguments )
+![Native distributed send throughput against writer count. The line follows the intended pace up to 30,000 writers, drops at 40,000, and stays flat around 220,000 messages per second up to 150,000 writers.](docs/figures/send-native.svg)
 
-    You will get who replied with {ok,Result} and who with {error,Error} or {badrpc,Reason}
+Up to 30,000 writers the node delivers what is asked. At 40,000 it delivers less than at 30,000. From there on adding senders adds nothing: throughput sits between 210,000 and 240,000 messages per second all the way to 150,000 writers, while the fixed workload takes 11 minutes instead of 100 seconds, sender memory grows to 34 GB (almost all of it encoded output buffers waiting for the port task, unbounded by the 1 MiB busy limit), and tens of thousands of processes wait in the run queues. Peak memory is `erlang:memory(total)` on the sender; about 2.2 GB of it is the process table for the harness's large `+P` and is present in every point. "Scheduler busy" is the share of scheduler wall time not spent idle and on this path includes time spent blocked in the distribution machinery.
 
-    [{Node1,Result1},{Node2,Result2}| _AndSoOn] = Replies
-    
-    [{Node1,Reject1},{Node2,Reject2}| _AndSoOn] = Rejects
+The knee at 30,000 to 40,000 writers is a property of this workload and hardware, not a constant of Erlang. The shape is.
 
+## What ecall does
 
-    If you need live use examples take a look at source code:
+When a connection to the remote node exists, `ecall:send(To, Msg)` does not send to `To` from the caller. It hashes the caller's pid over a pool of local proxies and hands the request to one of them:
 
+```erlang
+pick_worker(#connection{size = Size, pool = Pool}) ->
+  I = erlang:phash2(self(), Size),
+  maps:get(I, Pool).
 
+Proxy ! {do, {send, RemoteTo, Message}}
+```
 
-    https://github.com/vzroman/elock.git
-    https://github.com/vzroman/esubscribe.git
+The proxy loop is the whole idea:
 
-    A little advirtisement :-)
-    
+```erlang
+worker_loop(Remote, BatchSize) ->
+  erlang:garbage_collect(self()),
+  Requests = collect_requests(0, BatchSize),
+  catch Remote ! {batch, Requests},
+  worker_loop(Remote, BatchSize).
 
-BUILD
------
-    Add it as a dependency to your application and you are ready (I use rebar3)
-    {deps, [
-        ......
-        {ecall, {git, "git@github.com:vzroman/ecall.git", {branch, "main"}}}
-    ]}.
+collect_requests(0, BatchSize) ->
+  receive
+    {do, Request} -> [Request | collect_requests(1, BatchSize)]
+  end;                                   % nothing waiting: block
+collect_requests(Count, BatchSize) when Count < BatchSize ->
+  receive
+    {do, Request} -> [Request | collect_requests(Count + 1, BatchSize)]
+  after
+    0 -> []                              % mailbox empty: ship what we have
+  end;
+collect_requests(_Count, _BatchSize) ->
+  [].                                    % batch cap reached
+```
 
-TODO
------
-    Tests!!!
-    
+`Remote` is one worker of the receiver pool on the other node, paired with this proxy. It replays the batch locally: a `send` element becomes `To ! Message`, a `cast` element becomes `spawn(M, F, Args)`, and a `call` element becomes a spawned process that applies the function and sends the result back to the caller through the pooled channel in the opposite direction, so both legs are batched.
+
+The principles, in the order they matter:
+
+1. **Batch before the queue.** The distribution queue is entered once per batch instead of once per message: one encode, one lock acquisition, one append, one socket write, and the distribution header paid once. At 150,000 writers the same 150 million messages went over the wire as 25.4 GB instead of 33.8 GB.
+2. **Pool both ends.** One batching process is a new single point on each side. The receiver pool defaults to the number of logical processors on the receiving node, and a connection creates one local proxy per remote worker. Callers are sharded onto proxies by pid, so the pool runs in parallel with no coordination.
+3. **Never wait for a batch to fill.** The proxy blocks only when it has nothing at all. Once it has one request it takes whatever else is already in its mailbox and ships. At low load a batch holds one or two messages and the funnel costs one local hop. Under pressure the backlog grows, batches grow with it, and when a proxy is suspended on the busy limit its callers keep filling its mailbox, so it ships everything that accumulated as one batch on resume. The runtime's own backpressure is the batching clock. The batch cap is a safety valve, not an operating point.
+
+## Measurements
+
+Same hosts and matrix as above, three operations: `!` against `ecall:send/2`, `erpc:cast/4` against `ecall:cast/4`, and `erpc:call/4` against `ecall:call/4`. ecall ran with the defaults: pool 48, batch cap 1,000, `+zdbbl 1024`. For casts the cast function sends to a counter process on node B, so a point completes only when every cast has executed remotely. For calls each writer waits for its reply before sleeping.
+
+### Send
+
+| writers | native `!` msg/s | `ecall:send` msg/s | ratio |
+|--------:|-----------------:|-------------------:|------:|
+| 10,000 | 99,126 | 99,116 | 1.00 |
+| 20,000 | 198,081 | 197,551 | 1.00 |
+| 30,000 | 294,844 | 293,284 | 0.99 |
+| 40,000 | 224,678 | 395,893 | 1.76 |
+| 50,000 | 211,222 | 483,706 | 2.29 |
+| 60,000 | 208,307 | 593,798 | 2.85 |
+| 80,000 | 219,115 | 753,232 | 3.44 |
+| 100,000 | 220,594 | 925,254 | 4.19 |
+| 120,000 | 230,180 | 1,137,095 | 4.94 |
+| 150,000 | 227,575 | 1,482,131 | 6.51 |
+
+![Send throughput against writer count for native distribution and ecall. Native flattens at about 220,000 messages per second after 30,000 writers; ecall follows the intended pace to 1.48 million messages per second at 150,000 writers.](docs/figures/send-native-vs-ecall.svg)
+
+Below the knee the two paths are indistinguishable. Above it ecall keeps following the intended pace, 98.8 % of it at 150,000 writers, so the test's own pacing was the limit at the top of the sweep. The same 150 million messages took 659 seconds natively and 101 seconds through the pool.
+
+### Cast
+
+| writers | `erpc:cast` casts/s | `ecall:cast` casts/s | ratio |
+|--------:|--------------------:|---------------------:|------:|
+| 10,000 | 99,011 | 97,553 | 0.99 |
+| 20,000 | 117,545 | 191,419 | 1.63 |
+| 30,000 | 104,975 | 283,024 | 2.70 |
+| 50,000 | 104,632 | 456,021 | 4.36 |
+| 80,000 | 95,122 | 697,362 | 7.33 |
+| 100,000 | 82,630 | 854,146 | 10.34 |
+| 120,000 | 82,270 | 990,549 | 12.04 |
+| 150,000 | 86,147 | 1,189,117 | 13.80 |
+
+### Call
+
+| writers | `erpc:call` calls/s | `ecall:call` calls/s | ratio |
+|--------:|--------------------:|---------------------:|------:|
+| 10,000 | 99,014 | 99,037 | 1.00 |
+| 20,000 | 109,905 | 197,268 | 1.79 |
+| 30,000 | 111,896 | 212,754 | 1.90 |
+| 50,000 | 107,551 | 198,516 | 1.85 |
+| 80,000 | 85,270 | 245,525 | 2.88 |
+| 100,000 | 77,068 | 319,656 | 4.15 |
+| 120,000 | 71,920 | 339,644 | 4.72 |
+| 150,000 | 65,423 | 403,468 | 6.17 |
+
+![Cast and call throughput against writer count, native and ecall, as two panels on the same scale. erpc:cast stays near 100,000 per second and declines; ecall:cast reaches 1.19 million per second. erpc:call declines from 110,000 to 65,000 per second; ecall:call reaches 403,000 per second.](docs/figures/cast-call.svg)
+
+The native cast path is the worst of the three: it never scales past about 118,000 casts per second and declines from there, because an `erpc:cast` is a spawn request rather than a message. At 120,000 writers the same 120 million casts finished in 121 seconds through ecall instead of 1,459.
+
+Calls are the hardest case for any transport, since every writer has one round trip in flight. Both paths peak far below send. ecall still delivers six times the calls per second at the top of the sweep, at 27 % of the intended pace where `erpc:call` is at 4 %.
+
+### Resources at 150,000 writers
+
+| operation | native peak memory | ecall peak memory | native scheduler busy | ecall scheduler busy | native max run queue | ecall max run queue |
+|---|--:|--:|--:|--:|--:|--:|
+| send | 34.2 GB | 3.2 GB | 87.0 % | 34.9 % | 76,206 | 1,185 |
+| cast | 57.5 GB | 3.3 GB | 94.0 % | 44.7 % | 136,249 | 2,014 |
+| call | 34.9 GB | 3.3 GB | 48.9 % | 21.7 % | 74,448 | 15,476 |
+
+The ecall memory line is flat across the sweep, 2.3 GB at 10,000 writers and 3.3 GB at 150,000: it grows with the number of processes, not with the backlog. Scheduler time per million operations (`busy share × 48 schedulers × elapsed / millions of operations`):
+
+| operation | native | ecall | ratio |
+|---|--:|--:|--:|
+| send | 184 s | 11 s | 16× |
+| cast | 524 s | 18 s | 29× |
+| call | 359 s | 26 s | 14× |
+
+The network is not the limit in either case: at 150,000 writers the native send path wrote 51 MB/s to the distribution socket, ecall 251 MB/s, and the link carries about 1,250 MB/s.
+
+## Installation and startup
+
+Add ecall as a rebar3 dependency:
+
+```erlang
+{deps, [
+  {ecall, {git, "https://github.com/vzroman/ecall.git", {branch, "main"}}}
+]}.
+```
+
+ecall is an OTP application. The proper way to start it is to list it in your application's dependencies so that the release boot script, or `application:ensure_all_started/1`, starts it before your code runs:
+
+```erlang
+%% myapp.app.src
+{application, myapp, [
+  ...
+  {applications, [kernel, stdlib, ecall]},
+  ...
+]}.
+```
+
+Starting the application runs `ecall_sup`, which supervises four children with a `one_for_one` strategy:
+
+| child | role |
+|---|---|
+| `pg` scope `ecall` | the process-group scope used for node discovery |
+| `ecall_receive` | the receiver pool on this node; joins the `pg` group |
+| `ecall_connection_sup` | a supervisor holding one connection process per remote node |
+| `ecall_pg_monitor` | watches the `pg` group and opens or closes connections as nodes come and go |
+
+If you would rather embed ecall in your own supervision tree, for example in an embedded release with a single top supervisor, add `ecall_sup` as a supervisor child and load the application beforehand so that its environment is available:
+
+```erlang
+init([]) ->
+  ok = application:load(ecall),
+  Ecall = #{
+    id => ecall_sup,
+    start => {ecall_sup, start_link, []},
+    restart => permanent,
+    shutdown => infinity,
+    type => supervisor,
+    modules => [ecall_sup]
+  },
+  {ok, {#{strategy => one_for_one, intensity => 10, period => 1000}, [Ecall]}}.
+```
+
+Do not start it both ways, and do not start a `pg` scope named `ecall` yourself: `ecall_sup` owns it.
+
+The repository also builds as a stand-alone release for the test suites (`./rebar3 shell` through `make shell` picks up [config/vm.args](config/vm.args) and [config/sys.config](config/sys.config)). That is not needed to use ecall as a library.
+
+## Configuration
+
+ecall reads two parameters from its application environment. In this repository they live in [config/apps/ecall.config](config/apps/ecall.config), which [config/sys.config](config/sys.config) includes:
+
+```erlang
+[
+  {ecall, [
+    {pool_size, undefined},
+    {batch_size, 1000}
+  ]}
+].
+```
+
+In your own release put the same `{ecall, [...]}` entry into your `sys.config`.
+
+**`pool_size`** is the number of worker processes in this node's receiver pool. It decides how many proxies every remote node creates for its connection to this node, because a connection has one proxy per remote worker. `undefined` (the default) means `erlang:system_info(logical_processors)` on this node. Read once when `ecall_receive` starts, so a change needs an application restart.
+
+The pool-size table above is the tuning evidence. On a 48-core host a pool of 24 or 48 was flat up to 400,000 senders, a pool of 8 fell off after 150,000, and a pool of 1 saturated at 100,000. More workers means more contenders on the distribution lock, fewer means more contention on each proxy's mailbox. Leaving it at the default, one worker per logical processor, is the right choice on hosts of any size that have been measured. Lower it only when the receiving node has many cores and you want to cap the number of processes a large cluster creates: with a pool of P and a cluster of N nodes, every node runs P receiver workers and (N − 1) × P proxies.
+
+**`batch_size`** is the maximum number of requests a proxy on this node ships in one batch. It is a cap, not a target: a proxy ships whatever is waiting the moment it has anything, and in the runs above batches never exceeded about 20 messages at 150,000 senders. The cap bounds the size of a single distribution signal when a proxy resumes after a long suspension. The default of 1000 is far above any measured operating point. It is read when a connection is created, so a change applies to connections opened after it (`ecall_connection:disconnect/1` followed by `ecall_connection:connect/1` reopens one).
+
+**`+zdbbl`** is deliberately left at the emulator default of 1024 KiB on the pooled path. The busy limit is what turns backpressure into bigger batches. Raising it in earlier runs made the batches smaller and the memory larger without adding throughput.
+
+## Node discovery and connections
+
+ecall does not do cluster formation. It relies on Erlang distribution being connected, by `net_adm:ping/1`, `-connect_all`, a cluster library, or whatever you already use. On top of that, nodes that run ecall find each other automatically:
+
+1. `ecall_receive` on every node joins the group `nodes` in the `pg` scope `ecall`. `pg` replicates group membership across all distribution-connected nodes on its own.
+2. `ecall_pg_monitor` subscribes to that group with `pg:monitor/2`. For every member on another node, at startup and on every later `join` event, it calls `ecall_connection:connect(Node)`.
+3. `connect/1` starts a connection process under `ecall_connection_sup`. That process asks the remote `ecall_receive` for its list of workers (10 second timeout), spawns one `off_heap` proxy per remote worker, linked to itself, and registers the connection in a `persistent_term` so that lookups on the send path are lock-free. Both nodes do this independently, so a pair of nodes ends up with a proxy pool in each direction.
+4. On a `leave` event, which `pg` emits when the remote `ecall_receive` stops or the distribution link to that node drops, the monitor calls `ecall_connection:disconnect(Node)`. The connection process and its proxies are terminated, and traffic to that node falls back to the native path until the node rejoins.
+
+A failed connection attempt (for example, the remote receiver did not answer within the timeout) is logged and retried at the next `join` event for that node. If a proxy dies, the connection process dies with it and the supervisor restarts the whole connection.
+
+`ecall:connection_info/1` shows the state of a connection from the calling node's point of view:
+
+```erlang
+1> ecall:connection_info('node_b@host').
+{ok,#{status => connected,
+      connection_pid => <0.245.0>,
+      proxy_count => 48,
+      batch_size => 1000}}
+2> ecall:connection_info('unknown@host').
+{error,not_connected}
+```
+
+Connections can also be managed by hand with `ecall_connection:connect/1` and `ecall_connection:disconnect/1`. The monitor will reopen a connection it sees as a live group member at the next `join` event.
+
+## API
+
+All functions live in the `ecall` module. `Node` is a node name, `Nodes` is a non-empty list of node names which may include the local node, and `Module`, `Function`, `Args` are the usual MFA triple.
+
+### Single-node functions
+
+These three are drop-in replacements for the native operations. If there is no ecall connection to the target node they call the native operation instead, so they are safe to use in a cluster where only some nodes run ecall.
+
+#### `send(To, Message) -> Message`
+
+Replaces `To ! Message`. `To` is a pid or a `{RegisteredName, Node}` tuple. A local destination is sent to directly. The function returns `Message`, like `!`.
+
+```erlang
+ecall:send(RemotePid, {update, Key, Value}),
+ecall:send({my_server, 'node_b@host'}, {update, Key, Value}).
+```
+
+Use it wherever a process on one node sends to a process on another node from many processes at once: subscriptions, replication streams, event fan-out.
+
+#### `cast(Node, Module, Function, Args) -> ok`
+
+Replaces `erpc:cast/4`. The remote worker runs `spawn(Module, Function, Args)` and nobody waits for the result. Casts to the local node go through `erpc:cast/4`, which spawns locally.
+
+```erlang
+ok = ecall:cast('node_b@host', my_index, insert, [Key, Value]).
+```
+
+#### `call(Node, Module, Function, Args) -> {ok, Value} | {error, Reason}`
+
+Replaces `erpc:call/4`. The remote worker spawns a process that runs `apply(Module, Function, Args)` and sends the result back through the pooled channel.
+
+- If the function returns `{error, Reason}`, the call returns that `{error, Reason}` unchanged. Any other return value `Value` is wrapped as `{ok, Value}`.
+- If the function raises, the call returns `{error, {exit, Reason}}`.
+- If the connection to the node goes down while the call is in flight, the call returns `{error, {badrpc, Reason}}`. The caller monitors its proxy, and proxies die with the connection, so a call cannot hang on a dead node.
+- With no connection, `erpc:call/4` is used and its exceptions are mapped to the same shapes.
+
+There is no timeout argument. A call waits until the function returns or the connection goes down, which is the behaviour of `erpc:call/4` with the default `infinity`.
+
+```erlang
+{ok, 42} = ecall:call('node_b@host', my_counter, value, [Key]),
+{error, not_found} = ecall:call('node_b@host', my_index, lookup, [MissingKey]),
+{error, {exit, {badarith, _}}} = ecall:call('node_b@host', erlang, '/', [1, 0]).
+```
+
+Note that a function returning `{ok, X}` produces `{ok, {ok, X}}`. The convention throughout ecall is that `{error, _}` means rejection and everything else means success.
+
+### Group functions
+
+The group functions apply the same MFA to a list of nodes with a policy about which nodes to use and how many answers to wait for. The called function follows the same convention: `{error, Reason}` is a rejection, any other value is a success. A node that cannot be reached, or on which the function crashed, yields `{badrpc, Reason}` as its error. By default such nodes are ignored, as if they were not in the list; the optional fifth argument `RpcErr = true` makes them count as ordinary errors, which is what you want when "unreachable" is itself a decision-relevant answer.
+
+All of them return node-tagged results, `{Node, Value}`, so the caller knows which node answered.
+
+#### `call_one(Nodes, M, F, As [, RpcErr]) -> {ok, {Node, Value}} | {error, [{Node, Reason}]} | {error, none_is_available}`
+
+Try nodes one at a time until one succeeds. If the local node is in the list it is tried first; otherwise nodes are tried in random order. A node that answers `{error, Reason}` is recorded and the next node is tried. If every node fails, the accumulated errors are returned; with the default `RpcErr = false` and every node unreachable that list is empty, `{error, []}`. `none_is_available` is returned for an empty node list.
+
+```erlang
+case ecall:call_one(Replicas, my_store, read, [Key]) of
+  {ok, {_Node, Value}} -> Value;
+  {error, Errors} -> handle(Errors)
+end.
+```
+
+Useful when the nodes are interchangeable and one answer is enough, and you want to load only one of them: reading from any replica of a record, looking up a value in a partitioned cache, asking one of several stateless workers to do a job. Preferring the local node makes the common case a local call. The cost is latency when the first choice fails, since attempts are sequential; if that matters, use `call_any`.
+
+#### `call_any(Nodes, M, F, As [, RpcErr]) -> {ok, {Node, Value}} | {error, [{Node, Reason}]} | {error, none_is_available}`
+
+Ask all nodes at the same time and take the first success. Other successes are discarded.
+
+If the local node is in the list, it is called first and alone. If the local call succeeds, the same MFA is then **cast** to all the other nodes and the local result is returned without waiting for them. If the local call fails, the remaining nodes are called in parallel as above.
+
+```erlang
+{ok, {Node, Value}} = ecall:call_any(Replicas, my_store, read, [Key]).
+```
+
+Useful when latency matters more than load: the answer arrives as fast as the fastest node can produce it, at the cost of running the function everywhere. The local-first behaviour fits a write that must be applied on every replica but only needs the local acknowledgement: the local write is the confirmation, the remote writes proceed in the background. With `RpcErr = true` an unreachable node is an error and appears in the error list; with the default it is skipped.
+
+#### `call_all(Nodes, M, F, As [, RpcErr]) -> {ok, [{Node, Value}]} | {error, {Node, Reason}} | {error, none_is_available}`
+
+Ask all nodes in parallel and require every one of them to succeed. The first rejection ends the call with that node's error; results from the other nodes are discarded, though the function has already been started on them. If all nodes succeed, the results are returned in the order the replies arrived. Unreachable nodes are skipped by default; `none_is_available` means the list was empty or none of the nodes could be reached.
+
+```erlang
+case ecall:call_all(Replicas, my_store, prepare, [Txn]) of
+  {ok, Results} -> commit(Results);
+  {error, {Node, Reason}} -> abort(Node, Reason)
+end.
+```
+
+Useful for operations that must hold everywhere or nowhere: the prepare phase of a two-phase commit, a schema change, a lock that must be taken on every node before proceeding, a consistency check that collects one value per node. Use `RpcErr = true` when a node that cannot be reached must veto the operation rather than be ignored.
+
+#### `call_all_wait(Nodes, M, F, As) -> {Replies, Rejects}`
+
+Ask all nodes in parallel and wait for every one of them, then return both lists: `Replies` is `[{Node, Value}]` for the nodes that succeeded, `Rejects` is `[{Node, Reason}]` for the nodes that answered `{error, Reason}` or were unreachable (`{badrpc, Reason}`). Nothing is treated as fatal, and each list is in the order the replies arrived. An empty node list returns `{[], []}`.
+
+```erlang
+{Replies, Rejects} = ecall:call_all_wait(nodes(), my_node, status, []),
+[io:format("~p: ~p~n", [N, S]) || {N, S} <- Replies],
+[io:format("~p failed: ~p~n", [N, R]) || {N, R} <- Rejects].
+```
+
+Useful when the caller wants the whole picture rather than a decision: gathering status or metrics from a cluster, a best-effort broadcast whose result is a report of who applied it, a cleanup that should run everywhere with failures logged rather than aborting the rest. It is the slowest policy because it always waits for the slowest node.
+
+#### `cast_one(Nodes, M, F, As) -> ok`
+
+Fire and forget at one node. If the local node is in the list it is chosen; otherwise a random node is. Returns immediately.
+
+```erlang
+ok = ecall:cast_one(Workers, my_jobs, run, [Job]).
+```
+
+Useful for distributing work that any one node can do, with no reply needed: pushing a job to one of a set of workers, spreading background tasks over a cluster. Preferring the local node keeps the work local when the caller is itself a worker node.
+
+#### `cast_all(Nodes, M, F, As) -> ok`
+
+Fire and forget at every node in the list, including the local one if present. Returns immediately.
+
+```erlang
+ok = ecall:cast_all(nodes(), my_cache, invalidate, [Key]).
+```
+
+Useful for broadcasts whose delivery does not need confirmation: cache invalidation, configuration reloads, notifying every node of an event, replicating a write where the caller does not wait for acknowledgement.
+
+### `connection_info(Node) -> {ok, Map} | {error, not_connected}`
+
+Reports whether this node has an ecall connection to `Node`, and its proxy count and batch size. See [Node discovery and connections](#node-discovery-and-connections).
+
+### Summary
+
+| function | nodes contacted | waits for | success | failure |
+|---|---|---|---|---|
+| `send/2` | one | nothing | `Message` | none reported |
+| `cast/4` | one | nothing | `ok` | none reported |
+| `call/4` | one | the reply | `{ok, Value}` | `{error, Reason}` |
+| `call_one/4,5` | one at a time | first success | `{ok, {Node, Value}}` | `{error, [{Node, Reason}]}` |
+| `call_any/4,5` | all in parallel | first success | `{ok, {Node, Value}}` | `{error, [{Node, Reason}]}` |
+| `call_all/4,5` | all in parallel | all successes | `{ok, [{Node, Value}]}` | `{error, {Node, Reason}}` |
+| `call_all_wait/4` | all in parallel | all replies | `{Replies, Rejects}` | never fails |
+| `cast_one/4` | one | nothing | `ok` | none reported |
+| `cast_all/4` | all | nothing | `ok` | none reported |
+
+## Semantics and limits
+
+- **Ordering is preserved per caller.** A caller always maps to the same proxy, a proxy emits batches in order, and the worker replays each batch in order. That is exactly Erlang's own guarantee: nothing is promised about the interleaving of different callers, and cast and call bodies run in independent processes with no ordering at all.
+- **Backpressure moves.** A native remote send suspends the caller when the channel is busy. `ecall:send/2` and `ecall:cast/4` return as soon as the request is in a proxy's mailbox. The proxies are flow-controlled by the distribution layer; the callers are not. Under sustained overload with no application-level admission control, proxy mailboxes grow without bound. ecall raises the ceiling by an order of magnitude and gives you a place to put the policy; it does not remove the need for one.
+- **Failure semantics match the native operations.** Send and cast are fire-and-forget on both paths. A call is protected by a monitor on its proxy and fails with `{badrpc, Reason}` when the connection goes down.
+- **One extra hop each way.** Two extra scheduling events and one local copy per message. Invisible above the saturation point, measurable below it: at 10,000 writers the call path shows slightly higher scheduler utilization through ecall than through `erpc`.
+- **Measurement limits.** One run per point, one 225-byte payload, no large binaries, sender-side metrics only. The intended rates are demand targets, not a fixed arrival rate, because the pacing loop stretches when an operation is slow.
+
+## Tests
+
+```sh
+make test               # unit suite: routing, connection lifecycle, batch sizing
+make performance_tests  # distributed suites; see test/performance/ for the Docker setup
+```
+
+The performance suites in [test/performance/](test/performance/) drive two Docker-hosted nodes from a controller machine over Common Test and produce the JSON behind the tables above. The write-ups of every investigation, including the lock profiles and the pool-size sweep, are in [perf_tests/](perf_tests/).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
