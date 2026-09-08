@@ -57,7 +57,7 @@ The usual knobs do not change this:
 - `process_flag(async_dist, true)` removes the suspension and nothing else. Without flow control memory grows until the VM is killed, which the [documentation](https://www.erlang.org/doc/apps/erts/erlang.html#process_flag_async_dist) warns about.
 - `erpc` is not the problem and not the fix. An `erpc:cast/4` or `erpc:call/4` travels through the same queue as a plain send, as a spawn request that is heavier on both ends.
 
-The full analysis, with lock profiles and everything that was tried, is in [the article](perf_tests/drafts/fabel/article.md).
+The full analysis, with lock profiles and everything that was tried, is in [the article](docs/article.md).
 
 ## What ecall does
 
