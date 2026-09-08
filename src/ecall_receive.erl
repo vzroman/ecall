@@ -58,6 +58,7 @@ master_loop( Workers )->
 
 
 worker_loop( State )->
+  erlang:garbage_collect(self()),
   receive
     {batch, Batch}->
       State1 = handle_batch(Batch, State),
