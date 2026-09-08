@@ -1,4 +1,4 @@
-.PHONY: performance_report
+.PHONY: compile clean_logs clean_build clean_all test performance_tests performance_report clean_tests shell
 
 compile:
 	./rebar3 compile

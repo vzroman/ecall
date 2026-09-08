@@ -201,7 +201,7 @@ run_route_test(ApiModule) ->
 %%=================================================================
 route_test_remote(Parent) ->
   receive
-    {batch, _Node, Requests} ->
+    {batch, Requests} ->
       Parent ! {route_test_batch, Requests},
       reply_to_call_requests(Requests),
       route_test_remote(Parent);
@@ -341,7 +341,7 @@ fake_remote_loop() ->
 
 batch_remote(Parent) ->
   receive
-    {batch, _Node, Requests} ->
+    {batch, Requests} ->
       Parent ! {batch_size, length(Requests)},
       batch_remote(Parent);
     fake_remote_stop ->
