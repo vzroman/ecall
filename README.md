@@ -360,11 +360,132 @@ Reports whether this node has an ecall connection to `Node`, and its proxy count
 
 ## Tests
 
+The repository has two independent test layers: a fast unit suite that runs on one machine, and a distributed performance suite that drives two Docker-hosted nodes and produces the JSON behind the tables above.
+
 ```sh
-make performance_tests  # distributed suites; see test/performance/ for the Docker setup
+make compile             # ./rebar3 compile
+make test                # unit suite
+make performance_tests   # distributed performance suite
+make performance_report  # build and serve the report over the collected runs
+make shell               # rebar3 shell with config/vm.args and config/sys.config
+make clean_logs          # rm -rf logs
+make clean_tests         # rm -rf _build/test, drops all collected runs
+make clean_build         # rm -rf _build and rebar.lock
+make clean_all           # clean_logs + clean_build
 ```
 
-The performance suites in [test/performance/](test/performance/) drive two Docker-hosted nodes from a controller machine over Common Test and produce the JSON behind the tables above. The write-ups of every investigation, including the lock profiles and the pool-size sweep, are in [perf_tests/](perf_tests/).
+### Unit tests
+
+```sh
+make test
+```
+
+
+### Performance tests
+
+```sh
+make performance_tests
+```
+
+Compiles and then runs `./rebar3 ct --spec=./test/performance/test.spec`. The machine running this command is the *controller*: it does not generate load itself. It starts one sender node and one receiver node as `peer` nodes inside Docker containers, connects them, starts ecall on both, waits for the ecall pools to connect in both directions, and then drives every point of the matrix over Common Test.
+
+
+#### Requirements
+
+- Docker on the controller and on every host named in `role_config`, usable by the invoking user.
+- The base image `erlang:27.2.2` in the local Docker image store. The suite never pulls: if it is missing the run fails with `{base_image_missing, ...}`, because the hosts these tests were written for have no registry access. Side-load it there (`docker save` / `docker load`) before the first run.
+- For remote roles, `sshpass` and password SSH access for the user in `role_config`.
+- Erlang distribution reachable between controller and both nodes. Containers run with `--network host`; the sender listens on port 4444 and the receiver on 4445, and both use a cookie the controller generates.
+
+On each run the controller rebuilds the image `ecall-performance:otp27` from the working tree, so the nodes always run the code you have. Set `ECALL_PERFORMANCE_PREBUILT_IMAGE=true` to use the image already in the store instead. For a remote role the controller compares the image ID on the host with the local one and, if they differ, streams the image over SSH (`docker save | gzip | ssh … docker load`), which takes a few minutes the first time.
+
+#### Configuring a run
+
+Two files control everything. [test/performance/test.spec](test/performance/test.spec) selects which suites run — by default only `performance_send_SUITE`, with the other two commented out:
+
+```erlang
+{suites, 'PERFORMANCE_TEST', [
+    performance_send_SUITE,
+    performance_cast_SUITE,
+    performance_call_SUITE
+]}.
+```
+
+[test/performance/performance.config](test/performance/performance.config) holds three terms.
+
+**`role_config`** says where the two nodes run. `local` puts the container on the controller machine, with the node named `sender@127.0.0.1` or `receiver@127.0.0.1`. A map puts it on another host over SSH, and then the node name is taken from the config, so it must match the host the container runs on:
+
+```erlang
+{role_config, #{
+  sender => #{
+    host => "rt-server1.fp",
+    node => "sender@rt-server1.fp",
+    user => "romanvozfp",
+    password => "secret"
+  },
+  receiver => #{
+    host => "rt-server2.fp",
+    node => "receiver@rt-server2.fp",
+    user => "romanvozfp",
+    password => "secret"
+  }
+}}.
+```
+
+Note that `performance.config` is a plain file in the repository and the remote form keeps the SSH password in clear text; keep real credentials out of commits.
+
+Both roles local is the quick way to check that a change runs at all; it measures loopback and two nodes competing for the same cores, not distribution. Everything in the tables above was measured with both roles remote, on two separate hosts.
+
+**`performance`** is the workload matrix:
+
+| key | meaning | default |
+|---|---|---|
+| `pace_ms` | pause between two operations of one writer, so the intended rate is `writer_count × 1000 / pace_ms` per second | 100 |
+| `messages_per_writer` | operations per writer, and with `pace_ms` the ideal duration of a point | 1000 |
+| `writer_counts` | one point per entry, per payload, per path | `[1000, 10000, 100000, 500000, 1000000]` |
+| `payloads` | payload profiles, one sweep each | all five |
+
+The payload profiles are defined in [test/performance/util/performance_payloads.erl](test/performance/util/performance_payloads.erl): `tiny` (one atom), `data` (a three-key map of ten-field maps, about 225 bytes encoded — the profile used for the tables above), and `binary_10kib`, `binary_100kib`, `binary_1mib`.
+
+The defaults are the suite's, not the file's; the shipped file overrides them with the sweep used for the article. Keep the matrix small when trying things out — the run time is roughly `points × messages_per_writer × pace_ms`, doubled because every point is measured on both paths.
+
+**`env_settings`** configures the two nodes:
+
+| key | effect |
+|---|---|
+| `ecall_batch_size` | `batch_size` in the ecall application environment on both nodes, before ecall is started |
+| `distribution_busy_limit_kib` | `+zdbbl` on both nodes |
+
+```erlang
+{env_settings, #{
+  ecall_batch_size => 1000,
+  distribution_busy_limit_kib => 1024
+}}.
+```
+
+Both values are recorded in every result, and the report groups points by them, so runs with different settings stay separate instead of being averaged together.
+
+The nodes also get `+P 134217727`, `+Q 1048576` and `+e 262144` so that the large writer counts fit, and the containers are started with `nofile=1048576`.
+
+#### Running the controller from a container
+
+For a controller host that cannot build images itself, [test/performance/controller.Dockerfile](test/performance/controller.Dockerfile) packages the controller, and [test/performance/run_offline_controller.sh](test/performance/run_offline_controller.sh) loads a pre-built image archive and runs it with the Docker socket, the config, the spec and the log directory mounted from `$ECALL_PERFORMANCE_ARTIFACT_DIR` (default `~/ecall_tests`), then restores log ownership to the invoking user.
+
+### Performance report
+
+```sh
+make performance_report
+```
+
+| metric | source |
+|---|---|
+| throughput, msg/s | `writer_count × messages_per_writer / elapsed` |
+| elapsed time, s | measured duration of the point |
+| maximum memory, GB | peak total memory on the receiver node |
+| scheduler utilization, % | receiver node, sampled over the point |
+| max run queue | longest run queue seen on the receiver node |
+| network, MB/s | distribution socket bytes over elapsed |
+| average packet, B | distribution socket bytes per packet |
 
 ## License
 
