@@ -58,11 +58,19 @@ master_loop( Workers )->
 
 
 worker_loop( State )->
-  erlang:garbage_collect(self()),
   receive
     {batch, Batch}->
       State1 = handle_batch(Batch, State),
+      erlang:garbage_collect(self()),
       worker_loop( State1 );
+    {{'DOWN', Ref, ClientPID}, _MonRef, process, _PID, Reason}->
+      if
+        Reason =/= normal->
+          catch ecall_connection:send(ClientPID, {'DOWN', Ref, Reason});
+        true ->
+          ignore
+      end,
+      worker_loop( State );
     _Unexpected->
       worker_loop( State )
   end.
@@ -77,15 +85,17 @@ handle_batch([{cast, Module, Function, Args}| Rest], State)->
   spawn(Module, Function, Args ),
   handle_batch( Rest, State);
 handle_batch([{call, Ref, ClientPID,  Module, Function, Args}| Rest], State)->
-  spawn(fun()->
-    try
-      Result = apply(Module, Function, Args),
-      ecall_connection:send( ClientPID, {Ref, Result} )
-    catch
-      _:Reason->
-        ecall_connection:send(ClientPID, {'DOWN', Ref, Reason})
-    end
-  end),
+  spawn_opt(
+    fun()->
+      Reply =
+        try apply(Module, Function, Args) of
+          Result -> {Ref, Result}
+        catch
+          _:Reason -> {'DOWN', Ref, Reason}
+        end,
+      ecall_connection:send( ClientPID, Reply )
+    end,
+    [{monitor, [{tag, {'DOWN', Ref, ClientPID}}]}]),
   handle_batch( Rest, State);
 handle_batch([], State)->
   State.

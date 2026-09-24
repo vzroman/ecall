@@ -52,12 +52,13 @@ cast(Node, Module, Function, Args)->
 % Make a reference and send:
 %   {do, {call, Ref, self(), M, F, As}}
 % to a proxy.
-% The receiver spawns a monitored process and keeps its PID
-% as #{ PID => {Ref, ClientPID }}
+% The receiver spawns a process monitored with the tag {'DOWN', Ref, ClientPID},
+% so it keeps nothing in its state.
 % The spawned process executes M:F(As) and sends the result to
-% ClientPID as {Ref, Result}.
-% On finishing of the spawned process the receiver gets {'DOWN',_,SpawnedPID, Reason}.
-% It takes corresponding {Ref, ClientPID} and if the Reason is not 'normal' sends the
+% ClientPID as {Ref, Result}, or {'DOWN', Ref, Reason} if M:F(As) raises.
+% On finishing of the spawned process the receiver gets
+%   {{'DOWN', Ref, ClientPID}, MonRef, process, SpawnedPID, Reason}
+% and if the Reason is not 'normal' (the process was killed) sends the
 %   {'DOWN', Ref, Reason} to ClientPID.
 call(Node, Module, Function, Args)->
   case get_node_proxy( Node ) of
