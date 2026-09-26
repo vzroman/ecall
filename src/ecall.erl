@@ -54,10 +54,8 @@ call_one(Ns,M,F,As,RpcErr) ->
     true ->
       case ecall_connection:call(N, M, F, As) of
         {ok,Result}->
-          ?LOGDEBUG("~p ok ~p",[N,Result]),
           {ok,{N,Result}};
         {error,Error}->
-          ?LOGDEBUG("~p error ~p",[N,Error]),
           call_one( Ns --[N], M, F, As, [{N,Error}], RpcErr)
       end;
     false->
@@ -68,19 +66,15 @@ call_one([],_M,_F,_As,Errors,_RpcErr)->
   {error,Errors};
 call_one( Ns,M,F,As,Errors,RpcErr)->
   N = ?RAND( Ns ),
-  ?LOGDEBUG("~p from ~p with ~p:~p(~p), RpcErr ~p",[N,Ns,M,F,As,RpcErr]),
   case ecall_connection:call(N, M, F, As) of
     {ok,Result}->
-      ?LOGDEBUG("~p ok ~p",[N,Result]),
       {ok,{N,Result}};
     {error, Error}->
       Errors1 =
         case Error of
-          {badrpc, Reason} when not RpcErr ->
-            ?LOGDEBUG("~p badrpc ~p",[N,Reason]),
+          {badrpc, _Reason} when not RpcErr ->
             Errors;
           _->
-            ?LOGDEBUG("~p error ~p",[N,Error]),
             [{N,Error} | Errors]
         end,
       call_one( Ns --[N], M, F, As, Errors1, RpcErr)
@@ -97,11 +91,9 @@ call_any(Ns,M,F,As,RpcErr)->
     true ->
       case ecall_connection:call(N, M, F, As) of
         {ok,Result}->
-          ?LOGDEBUG("~p ok ~p",[N,Result]),
           cast_all(Ns -- [N], M, F, As),
           {ok,{N,Result}};
         {error,Error}->
-          ?LOGDEBUG("~p error ~p",[N,Error]),
           do_call_any( Ns --[N], M, F, As, [{N,Error}], RpcErr)
       end;
     false->
@@ -109,7 +101,6 @@ call_any(Ns,M,F,As,RpcErr)->
   end.
 
 do_call_any(Ns,M,F,As,Errors,RpcErr)->
-  ?LOGDEBUG("~p with ~p:~p(~p), RpcErr",[Ns,M,F,As,RpcErr]),
   Owner = self(),
   Master = spawn(fun()->async_call_any(Owner,Ns,M,F,As,Errors,RpcErr) end),
   receive
@@ -127,16 +118,13 @@ wait_any(Owner, WaitFor, Errors, RpcErr) when WaitFor > 0 ->
   % I'm the master
   receive
     {N,{ok,Result}}->
-      ?LOGDEBUG("~p: result ~p",[N,Result]),
       Owner ! {ok,self(),{N,Result}};
     {N,{error,Error}}->
       Errors1 =
         case Error of
-          {badrpc, Reason} when not RpcErr->
-            ?LOGDEBUG("~p badrpc ~p",[N,Reason]),
+          {badrpc, _Reason} when not RpcErr->
             Errors;
           _->
-            ?LOGDEBUG("~p error ~p",[N,Error]),
             [{N, Error} | Errors]
         end,
       wait_any(Owner, WaitFor-1,Errors1,RpcErr)
@@ -156,7 +144,6 @@ call_all(Ns,M,F,As) ->
 call_all([],_M,_F,_As,_RpcErr)->
   {error,none_is_available};
 call_all(Ns,M,F,As,RpcErr)->
-  ?LOGDEBUG("~p with ~p:~p(~p), RpcErr ~p",[Ns,M,F,As,RpcErr]),
   Owner = self(),
   Master = spawn(fun()->async_call_all(Owner,Ns,M,F,As,RpcErr) end),
   receive
@@ -173,15 +160,12 @@ wait_all(Owner, WaitFor, OKs, RpcErr) when WaitFor > 0 ->
   % I'm the master
   receive
     {N,{ok,Result}}->
-      ?LOGDEBUG("~p result: ~p",[N,Result]),
       wait_all(Owner, WaitFor-1,[{N,Result}|OKs],RpcErr);
     {N,{error,Error}}->
       case Error of
-        {badrpc, Reason} when not RpcErr ->
-          ?LOGDEBUG("~p badrpc ~p",[N,Reason]),
+        {badrpc, _Reason} when not RpcErr ->
           wait_all(Owner,WaitFor-1,OKs,RpcErr);
         _->
-          ?LOGDEBUG("~p error ~p",[N,Error]),
           Owner ! {error,self(), {N,Error}}
       end
   end;
@@ -198,7 +182,6 @@ wait_all(Owner, _WaitFor=0, OKs,_RpcErr)->
 call_all_wait([],_M,_F,_As)->
   {[],[]};
 call_all_wait(Ns,M,F,As)->
-  ?LOGDEBUG("~p with ~p:~p(~p)",[Ns,M,F,As]),
   Owner = self(),
   Master = spawn(fun()->async_call_all_wait(Owner,Ns,M,F,As) end),
   receive
@@ -214,10 +197,8 @@ wait_all_wait(Owner, WaitFor, Replies, Rejects) when WaitFor > 0 ->
   % I'm the master
   receive
     {N,{ok,Result}}->
-      ?LOGDEBUG("~p result ~p",[N,Result]),
       wait_all_wait(Owner, WaitFor-1,[{N,Result}|Replies],Rejects);
     {N,{error,E}}->
-      ?LOGDEBUG("~p error ~p",[N,E]),
       wait_all_wait(Owner, WaitFor-1,Replies,[{N,E}|Rejects])
   end;
 wait_all_wait(Owner, _WaitFor=0, Replies, Rejects)->
@@ -230,16 +211,13 @@ cast_one(Ns,M,F,As)->
       true -> node();
       _-> ?RAND(Ns)
     end,
-  ?LOGDEBUG("~p from ~p with ~p:~p(~p)",[N,Ns,M,F,As]),
   ecall_connection:cast(N, M, F, As),
   ok.
 
 cast_all(Ns,M,F,As)->
-  ?LOGDEBUG("~p with ~p:~p(~p)",[Ns,M,F,As]),
   [ ecall_connection:cast(N, M, F, As) || N <- Ns ],
   ok.
 
 connection_info(Node)->
   ecall_connection:connection_info(Node).
-
 
