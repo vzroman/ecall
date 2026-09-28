@@ -13,7 +13,7 @@ clean_build:
 clean_all: clean_logs clean_build
 
 test:
-	./rebar3 ct --suite test/ecall_connection_SUITE.erl
+	./rebar3 ct --sname ecall_ct --suite test/ecall_app_SUITE.erl,test/ecall_receive_SUITE.erl,test/ecall_connection_SUITE.erl,test/ecall_reincarnation_SUITE.erl
 
 performance_tests: compile
 	./rebar3 ct --spec=./test/performance/test.spec

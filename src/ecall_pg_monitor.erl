@@ -43,28 +43,26 @@ handle_cast(Request,State)->
   ?LOGWARNING("unexpected cast resquest ~p",[Request]),
   {noreply,State}.
 
+% A joined member is a remote ecall_receive master: the connection master
+% of its node decides whether the pool has to be (re)built.
 handle_info({Ref, join, ?pg_group, Neighbours}, #state{ ref = Ref} = State)->
 
   [ try
       Node = node(N),
       ?LOGINFO("connecting to ~p",[ Node ]),
-      ecall_connection:connect( Node )
+      case ecall_connection:connect( Node, N ) of
+        ok -> ok;
+        {error, Error} -> ?LOGERROR("unable to connect to ~p, error ~p",[ Node, Error ])
+      end
     catch
       _:E -> ?LOGERROR("unable to connect to ~p, error ~p",[ node(N), E ])
     end|| N <- Neighbours, node(N) =/= node()],
 
   {noreply,State};
 
-handle_info({Ref, leave, ?pg_group, LeftNeighbours}, #state{ ref = Ref} = State)->
-
-  [ try
-      Node = node(N),
-      ?LOGWARNING("disconnect from ~p",[Node]),
-      ecall_connection:disconnect( Node )
-    catch
-      _:E -> ?LOGERROR("unable to disconnect to ~p, error ~p",[ node(N), E ])
-    end|| N <- LeftNeighbours, node(N) =/= node()],
-
+% leave is ignored: the incarnation process is linked to the remote receive
+% master and covers every case a leave would report.
+handle_info({Ref, leave, ?pg_group, _LeftNeighbours}, #state{ ref = Ref} = State)->
   {noreply,State};
 
 handle_info(Message,State)->

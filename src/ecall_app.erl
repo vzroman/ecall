@@ -9,7 +9,12 @@
 ]).
 
 start(_StartType, _StartArgs) ->
-    ecall_sup:start_link().
+    case ecall_receive:pool_size() of
+        {error, _} = Error ->
+            Error;
+        PoolSize ->
+            ecall_sup:start_link(PoolSize)
+    end.
 
 stop(_State) ->
     ok.

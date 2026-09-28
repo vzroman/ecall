@@ -7,7 +7,8 @@
 %% OTP API
 %%=================================================================
 -export([
-  start_link/0
+  start_link/1,
+  pool_size/0
 ]).
 
 -record(state,{}).
@@ -15,19 +16,44 @@
 %%=================================================================
 %% OTP API
 %%=================================================================
-start_link()->
+start_link( PoolSize )->
   case whereis( ?MODULE ) of
     PID when is_pid( PID )->
       {error, {already_started, PID}};
     _->
-      {ok, spawn_link(fun init_pool/0)}
+      Parent = self(),
+      {ok, spawn_link(fun()-> init_pool( Parent, PoolSize ) end)}
   end.
 
-init_pool()->
+% The single validator of pool_size, called once by ecall_app at start.
+-spec pool_size() -> pos_integer() | disabled | {error, {invalid_pool_size, term()}}.
+pool_size()->
+  case application:get_env(ecall, pool_size) of
+    undefined->
+      default_pool_size();
+    {ok, undefined}->
+      default_pool_size();
+    {ok, PoolSize} when is_integer( PoolSize ), PoolSize > 0->
+      PoolSize;
+    {ok, disabled}->
+      disabled;
+    {ok, Invalid}->
+      {error, {invalid_pool_size, Invalid}}
+  end.
+
+default_pool_size()->
+  case erlang:system_info( logical_processors ) of
+    unknown-> erlang:system_info( schedulers );
+    PoolSize-> PoolSize
+  end.
+
+init_pool( Parent, PoolSize )->
+
+  % Remote connections link their incarnation processes to this master,
+  % so their exits (killed, noconnection, normal) must not take the pool down.
+  process_flag( trap_exit, true ),
 
   register( ?MODULE, self() ),
-
-  PoolSize = pool_size(),
 
   Workers =
     [ spawn_opt(fun()-> worker_loop(#state{}) end,
@@ -36,24 +62,25 @@ init_pool()->
 
   pg:join(?pg_scope, ?pg_group, self() ),
 
-  master_loop( Workers ).
+  master_loop( Parent, Workers ).
 
-pool_size()->
-  case application:get_env(ecall, pool_size) of
-    {ok, PoolSize} when is_integer(PoolSize)->
-      PoolSize;
-    _->
-      erlang:system_info(logical_processors)
-  end.     
-
-
-master_loop( Workers )->
+master_loop( Parent, Workers )->
   receive
     {get_workers, Ref, From}->
-      catch From ! {Ref, Workers},
-      master_loop( Workers );
+      catch From ! {Ref, self(), Workers},
+      master_loop( Parent, Workers );
+    {'EXIT', Parent, Reason}->
+      exit( Reason );
+    {'EXIT', Worker, Reason}->
+      case lists:member( Worker, Workers ) of
+        true ->
+          exit( {worker_down, Worker, Reason} );
+        false ->
+          % a peer's incarnation process: killed, noconnection, normal
+          master_loop( Parent, Workers )
+      end;
     _->
-      master_loop( Workers )
+      master_loop( Parent, Workers )
   end.
 
 
@@ -66,7 +93,7 @@ worker_loop( State )->
     {{'DOWN', Ref, ClientPID}, _MonRef, process, _PID, Reason}->
       if
         Reason =/= normal->
-          catch ecall_connection:send(ClientPID, {'DOWN', Ref, Reason});
+          catch ecall_connection:call_reply(ClientPID, {'DOWN', Ref, Reason});
         true ->
           ignore
       end,
@@ -93,7 +120,7 @@ handle_batch([{call, Ref, ClientPID,  Module, Function, Args}| Rest], State)->
         catch
           _:Reason -> {'DOWN', Ref, Reason}
         end,
-      ecall_connection:send( ClientPID, Reply )
+      ecall_connection:call_reply( ClientPID, Reply )
     end,
     [{monitor, [{tag, {'DOWN', Ref, ClientPID}}]}]),
   handle_batch( Rest, State);

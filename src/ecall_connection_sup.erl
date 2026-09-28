@@ -12,7 +12,8 @@
 
 -export([
   start_connection/1,
-  stop_connection/1
+  stop_connection/1,
+  connection_master/1
 ]).
 
 start_link() ->
@@ -39,14 +40,35 @@ start_connection( Node )->
     modules=>[ecall_connection]
   },
   case supervisor:start_child(?MODULE, ChildSpec) of
-    {ok,_}-> ok;
-    {ok, _, _}-> ok;
-    {error, already_present}->ok;
-    {error, {already_started, _Pid}}->ok;
-    {error,Error} -> throw(Error)
+    {ok, Pid}-> {ok, Pid};
+    {ok, Pid, _}-> {ok, Pid};
+    {error, {already_started, Pid}}-> {ok, Pid};
+    {error, already_present}-> restart_connection( Node );
+    {error, Error} -> {error, Error}
   end.
 
+restart_connection( Node )->
+  case supervisor:restart_child(?MODULE, Node) of
+    {ok, Pid}-> {ok, Pid};
+    {ok, Pid, _}-> {ok, Pid};
+    {error, Error}-> {error, Error}
+  end.
+
+% The pid of the running connection master of the node, undefined otherwise.
+connection_master( Node )->
+  try lists:keyfind( Node, 1, supervisor:which_children(?MODULE) ) of
+    {Node, Pid, _Type, _Modules} when is_pid( Pid )-> Pid;
+    _-> undefined
+  catch
+    exit:_-> undefined
+  end.
+
+% ok only when the child is gone: a join racing the stop can restart it
+% between terminate_child and delete_child.
 stop_connection( Node )->
   supervisor:terminate_child(?MODULE, Node),
-  supervisor:delete_child( ?MODULE, Node),
-  ok.
+  case supervisor:delete_child( ?MODULE, Node) of
+    ok-> ok;
+    {error, not_found}-> ok;
+    {error, Error}-> {error, Error}
+  end.
