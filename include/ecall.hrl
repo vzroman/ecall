@@ -8,7 +8,7 @@
 
 %---------------supervisor defaults------------------------------------
 -define(MAX_RESTARTS,10).
--define(MAX_PERIOD,1000).
+-define(MAX_PERIOD,10).
 -define(STOP_TIMEOUT,1000).
 
 %--------------CONSTANTS-----------------------------------------------

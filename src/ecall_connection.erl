@@ -51,7 +51,8 @@
   remote,       % remote ecall_receive master pid of the current pool
   incarnation,  % incarnation pid
   monitor,      % monitor ref on the incarnation
-  pool          % #{ Index => Worker }
+  pool,         % #{ Index => Worker }
+  pending_join  % pid of a join received while connected, acted on in wait_join
 }).
 
 % The connection master is a state machine, one master_loop/1 clause per state:
@@ -62,11 +63,14 @@
 %   register: the single persistent_term:put of the pool -> connected.
 %   connected: the pool is in use. The incarnation DOWN tears the pool down
 %     -> wait_join. The parent exit and a worker exit tear it down and exit.
-%     Everything else is dropped, joins included: a new remote master can only
-%     appear after the old one died, and the old one's exit kills the
-%     incarnation first, so the master gets to wait_join through the DOWN.
-%   wait_join: no pool. A join -> request_pool, the parent exit -> exit.
+%     A join with the current remote pid is ignored. A join with another pid
+%     is kept in pending_join: the incarnation DOWN and a successor's join
+%     reach the master by different paths, so their order is not guaranteed,
+%     and a join queued during request_pool is only received here.
 %     Everything else is dropped.
+%   wait_join: no pool. A pending join -> request_pool at once. Otherwise
+%     a join -> request_pool, the parent exit -> exit, everything else is
+%     dropped.
 -define(wait_join, wait_join).
 -define(request_pool, request_pool).
 -define(register, register).
@@ -292,7 +296,8 @@ master_loop(#state{
 master_loop(#state{
   state = ?connected,
   monitor = Monitor,
-  parent = Parent
+  parent = Parent,
+  remote = Remote
 } =State)->
   receive
     {'DOWN', Monitor, process, _Incarnation, _Reason}->
@@ -304,6 +309,12 @@ master_loop(#state{
         monitor = undefined,
         pool = undefined
       });
+    {join, Remote}->
+      master_loop(State);
+    {join, UnexpectedRemote}->
+      master_loop(State#state{
+        pending_join = UnexpectedRemote
+      });
     {'EXIT', Parent, Reason}->
       teardown( State ),
       exit( Reason );
@@ -313,6 +324,17 @@ master_loop(#state{
     _Stale->
       master_loop( State )
   end;
+master_loop(#state{
+  state = ?wait_join,
+  pending_join = Remote,
+  node = Node
+} =State) when is_pid(Remote)->
+  ?LOGINFO("handling pending join from ~p, activating connection...",[Node]),
+  master_loop(State#state{
+    state = ?request_pool,
+    remote = Remote,
+    pending_join = undefined
+  });
 master_loop(#state{
   state = ?wait_join,
   parent = Parent,

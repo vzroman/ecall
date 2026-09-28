@@ -32,7 +32,7 @@
   incarnation_death_switches_to_native_path/1,
   call_reply_takes_native_path_when_incarnation_is_dead/1,
   inflight_call_fails_with_noconnection/1,
-  join_while_connected_is_ignored/1,
+  join_while_connected_keeps_pool/1,
   receive_restart_rebuilds_pool_on_join/1,
   master_restart_reconnects_through_registered_name/1,
   connection_info_reports_down_without_pool/1,
@@ -56,7 +56,7 @@ all() ->
     incarnation_death_switches_to_native_path,
     call_reply_takes_native_path_when_incarnation_is_dead,
     inflight_call_fails_with_noconnection,
-    join_while_connected_is_ignored,
+    join_while_connected_keeps_pool,
     receive_restart_rebuilds_pool_on_join,
     master_restart_reconnects_through_registered_name,
     connection_info_reports_down_without_pool,
@@ -304,9 +304,10 @@ inflight_call_fails_with_noconnection(_Config) ->
       end
     end).
 
-% While connected the master drops every join: a new remote master can only
-% appear after the old one died, and its exit kills the incarnation first.
-join_while_connected_is_ignored(_Config) ->
+% While connected a join never touches the pool: a join with the current
+% remote pid is ignored, one with another pid is only kept until the
+% incarnation dies.
+join_while_connected_keeps_pool(_Config) ->
   Node = node(),
   Remote = fake_remote(),
   OtherRemote = fake_remote(),
