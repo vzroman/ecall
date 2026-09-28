@@ -19,6 +19,8 @@
   cast_one/4,
   cast_all/4,
 
+  start_connection/1,
+  stop_connection/1,
   connection_info/1
 ]).
 
@@ -217,6 +219,16 @@ cast_one(Ns,M,F,As)->
 cast_all(Ns,M,F,As)->
   [ ecall_connection:cast(N, M, F, As) || N <- Ns ],
   ok.
+
+%===========================================================
+%   CONNECTIONS
+%===========================================================
+% Asynchronous: poll connection_info/1 for the result.
+start_connection(Node)->
+  ecall_connection:connect(Node).
+
+stop_connection(Node)->
+  ecall_connection:disconnect(Node).
 
 connection_info(Node)->
   ecall_connection:connection_info(Node).

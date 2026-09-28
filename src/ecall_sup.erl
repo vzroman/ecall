@@ -6,14 +6,16 @@
 -behaviour(supervisor).
 
 -export([
-  start_link/0,
+  start_link/1,
   init/1
 ]).
 
-start_link() ->
-    supervisor:start_link(?MODULE, []).
+start_link( PoolSize ) ->
+    supervisor:start_link(?MODULE, [ PoolSize ]).
 
-init([]) ->
+% PoolSize is a validated pool_size: a positive integer or disabled, in which
+% case the node runs without a receive pool and is invisible to its neighbours.
+init([ PoolSize ]) ->
 
   PG = #{
     id=> pg_scope,
@@ -26,7 +28,7 @@ init([]) ->
 
   Receive = #{
     id=> receive_pool,
-    start=>{ ecall_receive, start_link, []},
+    start=>{ ecall_receive, start_link, [ PoolSize ]},
     restart=> permanent,
     shutdown=> ?STOP_TIMEOUT,
     type=> worker,
@@ -57,9 +59,8 @@ init([]) ->
     period=> ?MAX_PERIOD
   },
 
-  {ok, {Supervisor, [
-    PG,
-    Receive,
-    ConnectionSup,
-    PG_monitor
-  ]}}.
+  {ok, {Supervisor,
+    [ PG ] ++
+    [ Receive || is_integer( PoolSize ) ] ++
+    [ ConnectionSup, PG_monitor ]
+  }}.

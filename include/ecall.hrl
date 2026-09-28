@@ -8,11 +8,10 @@
 
 %---------------supervisor defaults------------------------------------
 -define(MAX_RESTARTS,10).
--define(MAX_PERIOD,1000).
+-define(MAX_PERIOD,10).
 -define(STOP_TIMEOUT,1000).
 
 %--------------CONSTANTS-----------------------------------------------
--define(CONNECT_TIMEOUT, 10000).
 -define(BATCH_SIZE, 1000).
 
 %%-------------------------------------------------------------------------------
@@ -37,14 +36,23 @@
 
 -else.
 
--define(LOGERROR(Text),           ct:pal("error: " ++ Text)).
--define(LOGERROR(Text, Params),   ct:pal("error: " ++ Text, Params)).
--define(LOGWARNING(Text),         ct:pal("warning: " ++ Text)).
--define(LOGWARNING(Text, Params), ct:pal("warning: " ++ Text, Params)).
--define(LOGINFO(Text),            ct:pal("info: " ++ Text)).
--define(LOGINFO(Text, Params),    ct:pal("info: " ++ Text, Params)).
--define(LOGDEBUG(Text),           ct:pal("debug: " ++ Text)).
--define(LOGDEBUG(Text, Params),   ct:pal("debug: " ++ Text, Params)).
+% ct:pal works only on the node that runs common_test (rebar3 rewrites it to
+% cthr:pal, which exists only there). Peer nodes started by a suite run the
+% same beams and log through logger, peer forwards their output to the test node.
+-define(CT_PAL(Text, Params),
+  case whereis(ct_util_server) of
+    undefined -> logger:notice(Text, Params);
+    _ -> ct:pal(Text, Params)
+  end).
+
+-define(LOGERROR(Text),           ?CT_PAL("error: " ++ Text, [])).
+-define(LOGERROR(Text, Params),   ?CT_PAL("error: " ++ Text, Params)).
+-define(LOGWARNING(Text),         ?CT_PAL("warning: " ++ Text, [])).
+-define(LOGWARNING(Text, Params), ?CT_PAL("warning: " ++ Text, Params)).
+-define(LOGINFO(Text),            ?CT_PAL("info: " ++ Text, [])).
+-define(LOGINFO(Text, Params),    ?CT_PAL("info: " ++ Text, Params)).
+-define(LOGDEBUG(Text),           ?CT_PAL("debug: " ++ Text, [])).
+-define(LOGDEBUG(Text, Params),   ?CT_PAL("debug: " ++ Text, Params)).
 
 -endif.
 

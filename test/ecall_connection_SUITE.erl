@@ -2,6 +2,10 @@
 
 -include_lib("common_test/include/ct.hrl").
 
+% mirror the private records of ecall_receive: request and reply of get_pool/0
+-record(get_pool, {from}).
+-record(reply_pool, {workers}).
+
 %%=================================================================
 %% COMMON TEST API
 %%=================================================================
@@ -24,7 +28,16 @@
   reconnect_uses_updated_batch_env/1,
   disconnect_is_idempotent/1,
   pool_member_loss_invalidates_connection_pid/1,
-  worker_uses_configured_batch_size/1
+  worker_uses_configured_batch_size/1,
+  incarnation_death_switches_to_native_path/1,
+  call_reply_takes_native_path_when_incarnation_is_dead/1,
+  inflight_call_fails_with_noconnection/1,
+  join_while_connected_keeps_pool/1,
+  receive_restart_rebuilds_pool_on_join/1,
+  master_restart_reconnects_through_registered_name/1,
+  connection_info_reports_down_without_pool/1,
+  pool_appears_after_bootstrap_is_built_on_join/1,
+  ecall_start_stop_connection/1
 ]).
 
 %%=================================================================
@@ -39,13 +52,28 @@ all() ->
     reconnect_uses_updated_batch_env,
     disconnect_is_idempotent,
     pool_member_loss_invalidates_connection_pid,
-    worker_uses_configured_batch_size
+    worker_uses_configured_batch_size,
+    incarnation_death_switches_to_native_path,
+    call_reply_takes_native_path_when_incarnation_is_dead,
+    inflight_call_fails_with_noconnection,
+    join_while_connected_keeps_pool,
+    receive_restart_rebuilds_pool_on_join,
+    master_restart_reconnects_through_registered_name,
+    connection_info_reports_down_without_pool,
+    pool_appears_after_bootstrap_is_built_on_join,
+    ecall_start_stop_connection
   ].
 
 init_per_suite(Config) ->
   Config.
 
 end_per_suite(_Config) ->
+  case whereis(ecall_connection_sup) of
+    Sup when is_pid(Sup) ->
+      gen_server:stop(Sup);
+    undefined ->
+      ok
+  end,
   ok.
 
 init_per_testcase(_, Config) ->
@@ -66,16 +94,15 @@ ecall_api_delegates_to_connection(_Config) ->
 
 connection_info_reports_routing_metadata(_Config) ->
   Node = node(),
-  Remote = fake_remote(),
-  with_fake_receive([Remote],
+  Remotes = [fake_remote() || _ <- lists:seq(1, 3)],
+  with_fake_receive(Remotes,
     fun() ->
-      application:set_env(ecall, batch_size, 7),
       ok = ecall_connection:connect(Node),
-      {ok, Info} = ecall_connection:connection_info(Node),
+      Info = wait_until_connected(Node),
+      [connection_pid, proxy_count, status] = lists:sort(maps:keys(Info)),
       connected = maps:get(status, Info),
-      7 = maps:get(batch_size, Info),
+      ProxyCount = length(Remotes),
       ProxyCount = maps:get(proxy_count, Info),
-      true = is_integer(ProxyCount) andalso ProxyCount > 0,
       ConnectionPid = maps:get(connection_pid, Info),
       true = is_pid(ConnectionPid),
       true = erlang:is_process_alive(ConnectionPid)
@@ -87,36 +114,42 @@ connect_is_idempotent(_Config) ->
   with_fake_receive([Remote],
     fun() ->
       ok = ecall_connection:connect(Node),
-      {ok, Info1} = ecall_connection:connection_info(Node),
+      Info1 = wait_until_connected(Node),
       ConnectionPid = maps:get(connection_pid, Info1),
 
       ok = ecall_connection:connect(Node),
       {ok, Info2} = ecall_connection:connection_info(Node),
+      connected = maps:get(status, Info2),
       ConnectionPid = maps:get(connection_pid, Info2)
     end).
 
+% batch_size is read when the pool is built: a reconnect picks up a change.
 reconnect_uses_updated_batch_env(_Config) ->
   Node = node(),
-  Remote = fake_remote(),
+  Parent = self(),
+  Remote = spawn_link(fun() -> batch_remote(Parent) end),
   with_fake_receive([Remote],
     fun() ->
       application:set_env(ecall, batch_size, 2),
       ok = ecall_connection:connect(Node),
-      {ok, Info1} = ecall_connection:connection_info(Node),
+      Info1 = wait_until_connected(Node),
       Pid1 = maps:get(connection_pid, Info1),
-      2 = maps:get(batch_size, Info1),
+      send_while_suspended(only_proxy_for_low_level_batch_test(Info1), 5),
+      assert_batch_size(2),
+      assert_batch_size(2),
+      assert_batch_size(1),
 
       ok = ecall_connection:disconnect(Node),
       wait_until_dead(Pid1),
 
       application:set_env(ecall, batch_size, 3),
       ok = ecall_connection:connect(Node),
-      {ok, Info2} = ecall_connection:connection_info(Node),
+      Info2 = wait_until_connected(Node),
       Pid2 = maps:get(connection_pid, Info2),
-
       true = Pid1 =/= Pid2,
-      3 = maps:get(batch_size, Info2),
-      wait_until_dead(Pid1)
+      send_while_suspended(only_proxy_for_low_level_batch_test(Info2), 5),
+      assert_batch_size(3),
+      assert_batch_size(2)
     end).
 
 disconnect_is_idempotent(_Config) ->
@@ -126,11 +159,12 @@ disconnect_is_idempotent(_Config) ->
     fun() ->
       application:set_env(ecall, batch_size, 5),
       ok = ecall_connection:connect(Node),
-      {ok, Info} = ecall_connection:connection_info(Node),
+      Info = wait_until_connected(Node),
       Pid = maps:get(connection_pid, Info),
 
       ok = ecall_connection:disconnect(Node),
       wait_until_dead(Pid),
+      false = erlang:is_process_alive(Pid),
       {error, not_connected} = ecall_connection:connection_info(Node),
 
       ok = ecall_connection:disconnect(Node),
@@ -144,7 +178,7 @@ pool_member_loss_invalidates_connection_pid(_Config) ->
     fun() ->
       application:set_env(ecall, batch_size, 6),
       ok = ecall_connection:connect(Node),
-      {ok, Info} = ecall_connection:connection_info(Node),
+      Info = wait_until_connected(Node),
       Pid = maps:get(connection_pid, Info),
       Proxy = only_proxy_for_low_level_batch_test(Info),
 
@@ -161,7 +195,7 @@ worker_uses_configured_batch_size(_Config) ->
     fun() ->
       application:set_env(ecall, batch_size, 2),
       ok = ecall_connection:connect(Node),
-      {ok, Info} = ecall_connection:connection_info(Node),
+      Info = wait_until_connected(Node),
       Proxy = only_proxy_for_low_level_batch_test(Info),
       true = erlang:suspend_process(Proxy),
       try
@@ -176,6 +210,268 @@ worker_uses_configured_batch_size(_Config) ->
       assert_batch_size(1)
     end).
 
+incarnation_death_switches_to_native_path(_Config) ->
+  Node = node(),
+  Self = self(),
+  process_flag(trap_exit, true),
+  Remote = spawn_link(fun() -> forward_remote(Self) end),
+  with_fake_receive([Remote],
+    fun() ->
+      ok = ecall_connection:connect(Node),
+      wait_until_connected(Node),
+
+      ecall_connection:send(Self, probe_via_proxy),
+      wait_for({batch, Remote, [{send, Self, probe_via_proxy}]}),
+
+      kill_fake_receive(whereis(ecall_receive)),
+      wait_until_status(Node, down),
+
+      ecall_connection:send(Self, probe_native),
+      wait_for(probe_native),
+      {ok, Node} = ecall_connection:call(Node, erlang, node, []),
+      ok = ecall_connection:cast(Node, erlang, send, [Self, cast_native]),
+      wait_for(cast_native)
+    end).
+
+% send/2 is the plain lookup: while the master has not unpublished the
+% stale pool yet, it still routes through it. call_reply/2 checks the
+% incarnation and goes native the moment the remote receive master is gone.
+call_reply_takes_native_path_when_incarnation_is_dead(_Config) ->
+  Node = node(),
+  Self = self(),
+  process_flag(trap_exit, true),
+  Remote = spawn_link(fun() -> forward_remote(Self) end),
+  with_fake_receive([Remote],
+    fun() ->
+      ok = ecall_connection:connect(Node),
+      Info = wait_until_connected(Node),
+      Master = maps:get(connection_pid, Info),
+
+      ok = ecall_connection:call_reply(Self, {reply, 1}),
+      wait_for({batch, Remote, [{send, Self, {reply, 1}}]}),
+
+      Receive = whereis(ecall_receive),
+      {links, Links} = process_info(Receive, links),
+      [Incarnation] = [Pid || Pid <- Links, Pid =/= Self],
+
+      % hold the master so the stale pool stays published
+      true = erlang:suspend_process(Master),
+      try
+        kill_fake_receive(Receive),
+        wait_until_dead(Incarnation),
+        {ok, #{status := connected}} = ecall_connection:connection_info(Node),
+
+        ok = ecall_connection:call_reply(Self, {reply, 2}),
+        wait_for({reply, 2}),
+
+        ecall_connection:send(Self, plain_send),
+        wait_for({batch, Remote, [{send, Self, plain_send}]})
+      after
+        true = erlang:resume_process(Master)
+      end,
+      wait_until_status(Node, down)
+    end).
+
+inflight_call_fails_with_noconnection(_Config) ->
+  Node = node(),
+  Self = self(),
+  process_flag(trap_exit, true),
+  Remote = spawn_link(fun() -> forward_remote(Self) end),
+  with_fake_receive([Remote],
+    fun() ->
+      ok = ecall_connection:connect(Node),
+      wait_until_connected(Node),
+
+      Caller =
+        spawn(fun() ->
+          Self ! {call_result, ecall_connection:call(Node, m, f, [])}
+        end),
+      receive
+        {batch, Remote, [{call, _Ref, Caller, m, f, []}]} ->
+          ok
+      after
+        1000 ->
+          ct:fail(call_request_not_shipped)
+      end,
+
+      kill_fake_receive(whereis(ecall_receive)),
+      receive
+        {call_result, Result} ->
+          {error, {badrpc, noconnection}} = Result
+      after
+        1000 ->
+          ct:fail(inflight_call_hangs)
+      end
+    end).
+
+% While connected a join never touches the pool: a join with the current
+% remote pid is ignored, one with another pid is only kept until the
+% incarnation dies.
+join_while_connected_keeps_pool(_Config) ->
+  Node = node(),
+  Remote = fake_remote(),
+  OtherRemote = fake_remote(),
+  with_fake_receive([Remote],
+    fun() ->
+      ok = ecall_connection:connect(Node),
+      Info1 = wait_until_connected(Node),
+      Proxy1 = only_proxy_for_low_level_batch_test(Info1),
+
+      Other = start_fake_receive([OtherRemote]),
+      try
+        ok = ecall_connection:connect(Node, whereis(ecall_receive)),
+        ok = ecall_connection:connect(Node, Other),
+        timer:sleep(100),
+
+        {ok, Info1} = ecall_connection:connection_info(Node),
+        Proxy1 = only_proxy_for_low_level_batch_test(Info1),
+        true = erlang:is_process_alive(Proxy1)
+      after
+        Other ! fake_receive_stop
+      end
+    end),
+  OtherRemote ! fake_remote_stop,
+  ok.
+
+% The remote pool restarts: the incarnation dies with the old receive master,
+% the master waits for a join and asks the registered receive for the new pool.
+receive_restart_rebuilds_pool_on_join(_Config) ->
+  Node = node(),
+  Self = self(),
+  process_flag(trap_exit, true),
+  Remote1 = spawn_link(fun() -> forward_remote(Self) end),
+  Remote2 = spawn_link(fun() -> forward_remote(Self) end),
+  with_fake_receive([Remote1],
+    fun() ->
+      ok = ecall_connection:connect(Node),
+      Info1 = wait_until_connected(Node),
+      Master = maps:get(connection_pid, Info1),
+      Proxy1 = only_proxy_for_low_level_batch_test(Info1),
+
+      ecall_connection:send(Self, probe1),
+      wait_for({batch, Remote1, [{send, Self, probe1}]}),
+
+      kill_fake_receive(whereis(ecall_receive)),
+      #{connection_pid := Master} = wait_until_status(Node, down),
+
+      Receive2 = start_fake_receive([Remote2]),
+      true = register(ecall_receive, Receive2),
+      try
+        timer:sleep(100),
+        {ok, #{status := down, connection_pid := Master}} =
+          ecall_connection:connection_info(Node),
+
+        ok = ecall_connection:connect(Node, Receive2),
+        Info2 = wait_until_proxy_changed(Node, Proxy1),
+        Master = maps:get(connection_pid, Info2),
+
+        ecall_connection:send(Self, probe2),
+        wait_for({batch, Remote2, [{send, Self, probe2}]})
+      after
+        unregister_fake_receive(Receive2),
+        Receive2 ! fake_receive_stop
+      end
+    end),
+  Remote2 ! fake_remote_stop,
+  ok.
+
+master_restart_reconnects_through_registered_name(_Config) ->
+  Node = node(),
+  Remote = fake_remote(),
+  with_fake_receive([Remote],
+    fun() ->
+      ok = ecall_connection:connect(Node),
+      Info1 = wait_until_connected(Node),
+      Master1 = maps:get(connection_pid, Info1),
+
+      exit(Master1, kill),
+      wait_until_dead(Master1),
+
+      Info2 = wait_until_reconnected(Node, Master1),
+      Master2 = maps:get(connection_pid, Info2),
+      true = Master1 =/= Master2,
+      true = erlang:is_process_alive(Master2)
+    end).
+
+% No receive pool: get_pool/0 returns not_active and the master waits
+% for a join without publishing anything.
+connection_info_reports_down_without_pool(_Config) ->
+  Node = node(),
+  with_no_receive(
+    fun() ->
+      ok = ecall_connection:connect(Node),
+      {ok, #{status := down, connection_pid := Master}} =
+        ecall_connection:connection_info(Node),
+      true = erlang:is_process_alive(Master),
+      undefined = persistent_term:get({ecall_connection, Node}, undefined),
+
+      timer:sleep(100),
+      {ok, #{status := down, connection_pid := Master}} =
+        ecall_connection:connection_info(Node),
+      undefined = persistent_term:get({ecall_connection, Node}, undefined),
+
+      % the master exits on the supervisor's shutdown, it is not killed
+      % after the shutdown timeout
+      Monitor = erlang:monitor(process, Master),
+      ok = ecall_connection:disconnect(Node),
+      false = erlang:is_process_alive(Master),
+      receive
+        {'DOWN', Monitor, process, Master, shutdown} ->
+          ok
+      after
+        0 ->
+          ct:fail(master_not_shut_down)
+      end,
+      {error, not_connected} = ecall_connection:connection_info(Node)
+    end).
+
+% A pool that appears after the bootstrap is built only on a join:
+% the master does not poll.
+pool_appears_after_bootstrap_is_built_on_join(_Config) ->
+  Node = node(),
+  Self = self(),
+  Remote = spawn_link(fun() -> forward_remote(Self) end),
+  with_no_receive(
+    fun() ->
+      ok = ecall_connection:connect(Node),
+      {ok, #{status := down, connection_pid := Master}} =
+        ecall_connection:connection_info(Node),
+      wait_until_waiting(Master),
+
+      Receive = start_fake_receive([Remote]),
+      true = register(ecall_receive, Receive),
+      try
+        timer:sleep(100),
+        {ok, #{status := down, connection_pid := Master}} =
+          ecall_connection:connection_info(Node),
+
+        ok = ecall_connection:connect(Node, Receive),
+        #{connection_pid := Master} = wait_until_connected(Node),
+
+        ecall_connection:send(Self, probe),
+        wait_for({batch, Remote, [{send, Self, probe}]})
+      after
+        unregister_fake_receive(Receive),
+        Receive ! fake_receive_stop
+      end
+    end),
+  Remote ! fake_remote_stop,
+  ok.
+
+ecall_start_stop_connection(_Config) ->
+  Node = node(),
+  Remote = fake_remote(),
+  with_fake_receive([Remote],
+    fun() ->
+      ok = ecall:start_connection(Node),
+      Info = wait_until_connected(Node),
+      Master = maps:get(connection_pid, Info),
+
+      ok = ecall:stop_connection(Node),
+      wait_until_dead(Master),
+      {error, not_connected} = ecall:connection_info(Node)
+    end).
+
 run_route_test(ApiModule) ->
   Parent = self(),
   Node = node(),
@@ -184,6 +480,7 @@ run_route_test(ApiModule) ->
     fun() ->
       application:set_env(ecall, batch_size, 16),
       ok = ecall_connection:connect(Node),
+      wait_until_connected(Node),
       Sender =
         spawn(fun() -> route_test_sender(Parent, Node, ApiModule) end),
 
@@ -296,11 +593,26 @@ ensure_connection_supervisor() ->
   end.
 
 with_fake_receive(Workers, Fun) ->
+  with_receive(fun() -> fake_receive_loop(Workers) end, Workers, Fun).
+
+% No receive pool on the node: get_pool/0 returns not_active.
+with_no_receive(Fun) ->
   Node = node(),
   ensure_connection_supervisor(),
   ok = ecall_connection:disconnect(Node),
   undefined = whereis(ecall_receive),
-  Receive = spawn_link(fun() -> fake_receive_loop(Workers) end),
+  try
+    Fun()
+  after
+    ok = ecall_connection:disconnect(Node)
+  end.
+
+with_receive(Loop, Workers, Fun) ->
+  Node = node(),
+  ensure_connection_supervisor(),
+  ok = ecall_connection:disconnect(Node),
+  undefined = whereis(ecall_receive),
+  Receive = start_receive(Loop),
   true = register(ecall_receive, Receive),
   try
     Fun()
@@ -311,13 +623,37 @@ with_fake_receive(Workers, Fun) ->
     stop_workers(Workers)
   end.
 
+start_fake_receive(Workers) ->
+  start_receive(fun() -> fake_receive_loop(Workers) end).
+
+% The real receive master traps exits: the incarnation processes of the
+% connections link to it and their exits must not take it down.
+start_receive(Loop) ->
+  spawn_link(fun() ->
+    process_flag(trap_exit, true),
+    Loop()
+  end).
+
 fake_receive_loop(Workers) ->
   receive
-    {get_workers, Ref, From} ->
-      From ! {Ref, Workers},
+    #get_pool{from = From} ->
+      From ! #reply_pool{workers = Workers},
+      fake_receive_loop(Workers);
+    {'EXIT', _Pid, _Reason} ->
       fake_receive_loop(Workers);
     fake_receive_stop ->
       ok
+  end.
+
+% The fake receive is linked to the test process, which must trap exits.
+kill_fake_receive(Receive) ->
+  exit(Receive, kill),
+  receive
+    {'EXIT', Receive, killed} ->
+      ok
+  after
+    1000 ->
+      ct:fail({fake_receive_not_killed, Receive})
   end.
 
 unregister_fake_receive(Receive) ->
@@ -348,18 +684,42 @@ batch_remote(Parent) ->
       ok
   end.
 
+% Forwards every batch tagged with its own pid, so a test can tell
+% which remote worker a request reached.
+forward_remote(Parent) ->
+  receive
+    {batch, Requests} ->
+      Parent ! {batch, self(), Requests},
+      forward_remote(Parent);
+    fake_remote_stop ->
+      ok
+  end.
+
 stop_workers(Workers) ->
   [Worker ! fake_remote_stop || Worker <- Workers],
   ok.
 
 %%=================================================================
 only_proxy_for_low_level_batch_test(Info) ->
+  [Proxy] = proxies_of(Info),
+  Proxy.
+
+proxies_of(Info) ->
   ConnectionPid = maps:get(connection_pid, Info),
   {links, Links} = process_info(ConnectionPid, links),
   Supervisor = whereis(ecall_connection_sup),
-  Proxies = [Pid || Pid <- Links, Pid =/= Supervisor],
-  [Proxy] = Proxies,
-  Proxy.
+  [Pid || Pid <- Links, Pid =/= Supervisor].
+
+% Queue Count sends in the suspended proxy, so it ships them in full batches.
+send_while_suspended(Proxy, Count) ->
+  true = erlang:suspend_process(Proxy),
+  try
+    [ ecall_connection:send(self(), {batch_probe, I})
+      || I <- lists:seq(1, Count) ]
+  after
+    true = erlang:resume_process(Proxy)
+  end,
+  ok.
 
 assert_batch_size(ExpectedSize) ->
   receive
@@ -396,6 +756,74 @@ wait_until_dead(Pid, Attempts) when Attempts > 0 ->
   end;
 wait_until_dead(Pid, 0) ->
   ct:fail({process_still_alive, Pid}).
+
+% The master waits in the receive of master_loop/1: without a pool that is
+% only the wait_join state, so the bootstrap request is over.
+wait_until_waiting(Master) ->
+  wait_until_waiting(Master, _Attempts = 50).
+
+wait_until_waiting(Master, 0) ->
+  ct:fail({master_not_waiting, Master});
+wait_until_waiting(Master, Attempts) ->
+  case process_info(Master, [status, current_function]) of
+    [{status, waiting}, {current_function, {ecall_connection, master_loop, 1}}] ->
+      ok;
+    _ ->
+      timer:sleep(20),
+      wait_until_waiting(Master, Attempts - 1)
+  end.
+
+wait_until_connected(Node) ->
+  wait_until_status(Node, connected).
+
+wait_until_status(Node, Status) ->
+  wait_until_status(Node, Status, _Attempts = 50).
+
+wait_until_status(_Node, Status, 0) ->
+  ct:fail({status_not_reached, Status});
+wait_until_status(Node, Status, Attempts) ->
+  case ecall_connection:connection_info(Node) of
+    {ok, #{status := Status} = Info} ->
+      Info;
+    _ ->
+      timer:sleep(20),
+      wait_until_status(Node, Status, Attempts - 1)
+  end.
+
+wait_until_proxy_changed(Node, OldProxy) ->
+  wait_until_proxy_changed(Node, OldProxy, _Attempts = 50).
+
+wait_until_proxy_changed(_Node, _OldProxy, 0) ->
+  ct:fail(proxy_not_changed);
+wait_until_proxy_changed(Node, OldProxy, Attempts) ->
+  case ecall_connection:connection_info(Node) of
+    {ok, #{status := connected} = Info} ->
+      case proxies_of(Info) of
+        [NewProxy] when NewProxy =/= OldProxy ->
+          Info;
+        _Transient ->
+          timer:sleep(20),
+          wait_until_proxy_changed(Node, OldProxy, Attempts - 1)
+      end;
+    _ ->
+      timer:sleep(20),
+      wait_until_proxy_changed(Node, OldProxy, Attempts - 1)
+  end.
+
+wait_until_reconnected(Node, OldMaster) ->
+  wait_until_reconnected(Node, OldMaster, _Attempts = 50).
+
+wait_until_reconnected(_Node, _OldMaster, 0) ->
+  ct:fail(connection_not_reestablished);
+wait_until_reconnected(Node, OldMaster, Attempts) ->
+  case ecall_connection:connection_info(Node) of
+    {ok, #{status := connected, connection_pid := Master} = Info}
+      when Master =/= OldMaster ->
+      Info;
+    _ ->
+      timer:sleep(20),
+      wait_until_reconnected(Node, OldMaster, Attempts - 1)
+  end.
 
 wait_until_connection_pid_invalidated(Node, OldPid) ->
   wait_until_connection_pid_invalidated(Node, OldPid, _Attempts = 50).
