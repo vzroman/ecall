@@ -44,7 +44,7 @@ handle_cast(Request,State)->
   {noreply,State}.
 
 % A joined member is a remote ecall_receive master: the connection master
-% of its node decides whether the pool has to be (re)built.
+% of its node acts on a join only while it waits for a pool.
 handle_info({Ref, join, ?pg_group, Neighbours}, #state{ ref = Ref} = State)->
 
   [ try

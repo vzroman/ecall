@@ -19,7 +19,9 @@
 %% TEST CASES
 %%=================================================================
 -export([
-  reply_carries_master_pid/1,
+  get_pool_returns_master_and_workers/1,
+  get_pool_without_pool_is_not_active/1,
+  get_pool_fails_when_master_dies/1,
   master_survives_peer_incarnation_exits/1,
   worker_death_restarts_whole_pool/1,
   parent_exit_propagates_reason/1
@@ -30,7 +32,9 @@
 %%=================================================================
 all() ->
   [
-    reply_carries_master_pid,
+    get_pool_returns_master_and_workers,
+    get_pool_without_pool_is_not_active,
+    get_pool_fails_when_master_dies,
     master_survives_peer_incarnation_exits,
     worker_death_restarts_whole_pool,
     parent_exit_propagates_reason
@@ -78,9 +82,9 @@ end_per_testcase(_, _Config) ->
 %%=================================================================
 %% TEST CASES
 %%=================================================================
-reply_carries_master_pid(_Config) ->
+get_pool_returns_master_and_workers(_Config) ->
   Master = start_receive(),
-  Workers = get_workers(Master),
+  {ok, {Master, Workers}} = ecall_receive:get_pool(),
   ?POOL_SIZE = length(Workers),
   true = lists:all(fun erlang:is_process_alive/1, Workers),
 
@@ -88,9 +92,31 @@ reply_carries_master_pid(_Config) ->
   [ wait_until_dead(Worker) || Worker <- Workers ],
   ok.
 
+get_pool_without_pool_is_not_active(_Config) ->
+  undefined = whereis(ecall_receive),
+  {error, not_active} = ecall_receive:get_pool().
+
+% The caller monitors the master: a master that dies before it answers
+% makes get_pool/0 return the exit reason instead of waiting forever.
+get_pool_fails_when_master_dies(_Config) ->
+  Self = self(),
+  Master = start_receive(),
+  true = erlang:suspend_process(Master),
+  spawn(fun() -> Self ! {get_pool_result, ecall_receive:get_pool()} end),
+  timer:sleep(50),
+
+  exit(Master, kill),
+  receive
+    {get_pool_result, Result} ->
+      {error, killed} = Result
+  after
+    1000 ->
+      ct:fail(get_pool_hangs)
+  end.
+
 master_survives_peer_incarnation_exits(_Config) ->
   Master = start_receive(),
-  Workers = get_workers(Master),
+  Workers = workers(Master),
 
   spawn(fun() -> link(Master), exit(killed) end),
   spawn(fun() -> link(Master), exit(noconnection) end),
@@ -98,13 +124,13 @@ master_survives_peer_incarnation_exits(_Config) ->
   timer:sleep(50),
 
   true = erlang:is_process_alive(Master),
-  Workers = get_workers(Master),
+  Workers = workers(Master),
 
   shutdown_receive(Master).
 
 worker_death_restarts_whole_pool(_Config) ->
   Master = start_receive(),
-  [Worker | Others] = get_workers(Master),
+  [Worker | Others] = workers(Master),
 
   exit(Worker, kill),
   receive
@@ -132,18 +158,9 @@ start_receive() ->
   wait_until_registered(ecall_receive, Master),
   Master.
 
-get_workers(Master) ->
-  Ref = make_ref(),
-  Master ! {get_workers, Ref, self()},
-  receive
-    {Ref, Master, Workers} ->
-      Workers;
-    {Ref, Other} ->
-      ct:fail({reply_without_master_pid, Other})
-  after
-    1000 ->
-      ct:fail(get_workers_timeout)
-  end.
+workers(Master) ->
+  {ok, {Master, Workers}} = ecall_receive:get_pool(),
+  Workers.
 
 shutdown_receive(Master) ->
   exit(Master, shutdown),

@@ -194,11 +194,11 @@ In your own release put the same `{ecall, [...]}` entry into your `sys.config`.
 
 **`pool_size`** is the number of worker processes in this node's receiver pool. It decides how many proxies every remote node creates for its connection to this node, because a connection has one proxy per remote worker. A positive integer is the pool size. `undefined` (the default) means `erlang:system_info(logical_processors)` on this node, or `erlang:system_info(schedulers)` when that is `unknown`. `disabled` starts the application without a receiver pool: the node is invisible to its neighbours, whose send, cast and call to it take the native path and whose `connection_info/1` for it is `{error, not_connected}`, while the node itself still sends to its neighbours through their pools and gets the replies to its calls natively. Any other value stops the application from starting with `{error, {invalid_pool_size, Value}}`. Read once at application start, so a change needs an application restart.
 
-**`batch_size`** is the maximum number of requests a proxy on this node ships in one batch. It is a cap, not a target: a proxy ships whatever is waiting the moment it has anything. The cap bounds the size of a single distribution signal when a proxy resumes after a long suspension. The default is 1000. It is read when a connection is created.
+**`batch_size`** is the maximum number of requests a proxy on this node ships in one batch. It is a cap, not a target: a proxy ships whatever is waiting the moment it has anything. The cap bounds the size of a single distribution signal when a proxy resumes after a long suspension. The default is 1000. It is read each time a connection builds its pool.
 
 ## Node discovery and connections
 
-ecall does not form the cluster. It relies on Erlang distribution being connected already, by `net_adm:ping/1`, `-connect_all`, a cluster library, or whatever you use. On top of that, nodes running ecall find each other through `pg`: the receiver pool on every node joins the group `nodes` in the `pg` scope `ecall`, and `ecall_pg_monitor` watches that group. When a receiver pool appears on another node, ecall starts a connection master for that node, or reuses the one it already has; the master fetches the remote pool's worker list and builds one local proxy per remote worker. Every pool build is guarded by an incarnation process linked to the remote receiver pool's master. When the remote node or its receiver pool goes away, the incarnation dies with it, the connection master unpublishes the pool and traffic to that node falls back to the native path, without waiting for `pg`; a call in flight returns `{error, {badrpc, noconnection}}`. The replies of remote calls check the incarnation directly, so a reply is never sent into a stale pool, which is what would otherwise hang the caller. The connection master stays and rebuilds the pool when `pg` announces the receiver pool again, so a node that restarts under the same name, or restarts only its ecall application, gets a fresh pool bound to its new incarnation and never receives traffic meant for the old one. A connection is removed only by `ecall:stop_connection/1`. Each node does this independently, so a pair of nodes has a proxy pool in each direction.
+ecall does not form the cluster. It relies on Erlang distribution being connected already, by `net_adm:ping/1`, `-connect_all`, a cluster library, or whatever you use. On top of that, nodes running ecall find each other through `pg`: the receiver pool on every node joins the group `nodes` in the `pg` scope `ecall`, and `ecall_pg_monitor` watches that group. When a receiver pool appears on another node, ecall starts a connection master for that node, or reuses the one it already has; the master asks the remote receiver pool for its master and workers and builds one local proxy per remote worker. Every pool build is guarded by an incarnation process linked to the remote receiver pool's master. When the remote node or its receiver pool goes away, the incarnation dies with it, the connection master unpublishes the pool and traffic to that node falls back to the native path, without waiting for `pg`; a call in flight returns `{error, {badrpc, noconnection}}`. The replies of remote calls check the incarnation directly, so a reply is never sent into a stale pool, which is what would otherwise hang the caller. The connection master stays and rebuilds the pool when `pg` announces the receiver pool again, so a node that restarts under the same name, or restarts only its ecall application, gets a fresh pool bound to its new incarnation and never receives traffic meant for the old one. A connection is removed only by `ecall:stop_connection/1`. Each node does this independently, so a pair of nodes has a proxy pool in each direction.
 
 `ecall:connection_info/1` shows the state of a connection from the calling node's point of view:
 
@@ -206,15 +206,14 @@ ecall does not form the cluster. It relies on Erlang distribution being connecte
 1> ecall:connection_info('node_b@host').
 {ok,#{status => connected,
       connection_pid => <0.245.0>,
-      proxy_count => 48,
-      batch_size => 1000}}
+      proxy_count => 48}}
 2> ecall:connection_info('node_c@host').
 {ok,#{status => down, connection_pid => <0.301.0>}}
 3> ecall:connection_info('unknown@host').
 {error,not_connected}
 ```
 
-`connected` means a pool is published and in use. `down` means a connection master exists but no pool is published: the remote receiver pool has not answered yet, or it went away and `pg` has not announced it again. `not_connected` means there is no connection master for that node.
+`connected` means a pool is published and in use. `down` means a connection master exists but no pool is published: the remote receiver pool has not answered yet, it went away and `pg` has not announced it again, or the remote node runs with `pool_size` set to `disabled`. `not_connected` means there is no connection master for that node.
 
 ## API
 
@@ -340,7 +339,7 @@ Useful for broadcasts whose delivery does not need confirmation: cache invalidat
 
 ### `start_connection(Node) -> ok | {error, Reason}`
 
-Starts a connection master for `Node` if there is none. Asynchronous: the pool is built when the remote receiver pool answers, poll `connection_info/1` for the result. Not needed in normal operation, `pg` discovery does this.
+Starts a connection master for `Node` if there is none. Asynchronous: the pool is built when the remote receiver pool answers, poll `connection_info/1` for the result. If the remote receiver pool is not there yet, the master waits until `pg` announces it; it does not poll. Not needed in normal operation, `pg` discovery does this.
 
 ### `stop_connection(Node) -> ok`
 
@@ -348,7 +347,7 @@ Tears the pool down and removes the connection master for `Node`. Traffic to `No
 
 ### `connection_info(Node) -> {ok, Map} | {error, not_connected}`
 
-Reports the state of this node's connection to `Node`: `{ok, #{status := connected, connection_pid := Pid, proxy_count := N, batch_size := B}}` when a pool is published and in use, `{ok, #{status := down, connection_pid := Pid}}` when a connection master exists but no pool is published, `{error, not_connected}` when there is no connection master. See [Node discovery and connections](#node-discovery-and-connections).
+Reports the state of this node's connection to `Node`: `{ok, #{status := connected, connection_pid := Pid, proxy_count := N}}` when a pool is published and in use, `{ok, #{status := down, connection_pid := Pid}}` when a connection master exists but no pool is published, `{error, not_connected}` when there is no connection master. See [Node discovery and connections](#node-discovery-and-connections).
 
 ### Summary
 
@@ -392,7 +391,7 @@ make clean_all           # clean_logs + clean_build
 make test
 ```
 
-Runs three Common Test suites: `ecall_receive_SUITE` (the receiver pool), `ecall_connection_SUITE` (routing, pool lifecycle and invalidation against a fake receiver pool) and `ecall_reincarnation_SUITE`, which starts `peer` nodes running the real application, crashes one and restarts it under the same name. The last one needs a distributed test node, so the target passes `--sname ecall_ct` and `epmd` must be available.
+Runs four Common Test suites: `ecall_app_SUITE` (`pool_size` validation at application start), `ecall_receive_SUITE` (the receiver pool), `ecall_connection_SUITE` (routing, pool lifecycle and invalidation against a fake receiver pool) and `ecall_reincarnation_SUITE`, which starts `peer` nodes running the real application, crashes one and restarts it under the same name. The last one needs a distributed test node, so the target passes `--sname ecall_ct` and `epmd` must be available.
 
 
 ### Performance tests

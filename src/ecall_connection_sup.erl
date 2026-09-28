@@ -30,6 +30,7 @@ init([]) ->
 
   {ok,{Supervisor, []}}.
 
+-spec start_connection(node()) -> {ok, pid()} | {error, term()}.
 start_connection( Node )->
   ChildSpec = #{
     id=> Node,
@@ -55,6 +56,7 @@ restart_connection( Node )->
   end.
 
 % The pid of the running connection master of the node, undefined otherwise.
+-spec connection_master(node()) -> pid() | undefined.
 connection_master( Node )->
   try lists:keyfind( Node, 1, supervisor:which_children(?MODULE) ) of
     {Node, Pid, _Type, _Modules} when is_pid( Pid )-> Pid;
@@ -65,6 +67,7 @@ connection_master( Node )->
 
 % ok only when the child is gone: a join racing the stop can restart it
 % between terminate_child and delete_child.
+-spec stop_connection(node()) -> ok | {error, term()}.
 stop_connection( Node )->
   supervisor:terminate_child(?MODULE, Node),
   case supervisor:delete_child( ?MODULE, Node) of

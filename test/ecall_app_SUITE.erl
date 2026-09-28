@@ -79,7 +79,7 @@ disabled_pool_starts_without_receive(_Config) ->
 default_pool_size_is_logical_processors(_Config) ->
   ok = application:start(ecall),
   Master = wait_until_registered(ecall_receive),
-  Workers = get_workers(Master),
+  {ok, {Master, Workers}} = ecall_receive:get_pool(),
   Expected =
     case erlang:system_info(logical_processors) of
       unknown ->
@@ -101,17 +101,6 @@ reset_application() ->
   end,
   application:unset_env(ecall, pool_size),
   ok.
-
-get_workers(Master) ->
-  Ref = make_ref(),
-  Master ! {get_workers, Ref, self()},
-  receive
-    {Ref, Master, Workers} ->
-      Workers
-  after
-    1000 ->
-      ct:fail(get_workers_timeout)
-  end.
 
 wait_until_registered(Name) ->
   wait_until_registered(Name, _Attempts = 50).

@@ -4,27 +4,33 @@
 -include("ecall.hrl").
 
 %%=================================================================
+%% API
+%%=================================================================
+-export([
+  pool_size/0,
+  get_pool/0
+]).
+
+%%=================================================================
 %% OTP API
 %%=================================================================
 -export([
-  start_link/1,
-  pool_size/0
+  start_link/1
 ]).
 
 -record(state,{}).
+% request of get_pool/0 to the receive master
+-record(get_pool,{
+  from
+}).
+% reply of the receive master to get_pool/0
+-record(reply_pool,{
+  workers
+}).
 
 %%=================================================================
-%% OTP API
+%% API
 %%=================================================================
-start_link( PoolSize )->
-  case whereis( ?MODULE ) of
-    PID when is_pid( PID )->
-      {error, {already_started, PID}};
-    _->
-      Parent = self(),
-      {ok, spawn_link(fun()-> init_pool( Parent, PoolSize ) end)}
-  end.
-
 % The single validator of pool_size, called once by ecall_app at start.
 -spec pool_size() -> pos_integer() | disabled | {error, {invalid_pool_size, term()}}.
 pool_size()->
@@ -41,10 +47,42 @@ pool_size()->
       {error, {invalid_pool_size, Invalid}}
   end.
 
+% Called on this node by a remote connection master through erpc. Returns the
+% receive master pid, which the remote incarnation process links to, and the
+% workers. not_active: there is no receive pool on this node (pool_size
+% disabled or ecall not started).
+-spec get_pool() -> {ok, {pid(), [pid()]}} | {error, term()}.
+get_pool()->
+  case whereis(?MODULE) of
+    Master when is_pid(Master) ->
+      Monitor = erlang:monitor(process, Master),
+      Master ! #get_pool{from = self()},
+      receive
+        #reply_pool{workers = Workers} ->
+          {ok, {Master, Workers}};
+        {'DOWN', Monitor, process, _, Reason}->
+          {error, Reason}
+      end;
+    _->
+      {error, not_active}
+  end.
+
 default_pool_size()->
   case erlang:system_info( logical_processors ) of
     unknown-> erlang:system_info( schedulers );
     PoolSize-> PoolSize
+  end.
+
+%%=================================================================
+%% OTP API
+%%=================================================================
+start_link( PoolSize )->
+  case whereis( ?MODULE ) of
+    PID when is_pid( PID )->
+      {error, {already_started, PID}};
+    _->
+      Parent = self(),
+      {ok, spawn_link(fun()-> init_pool( Parent, PoolSize ) end)}
   end.
 
 init_pool( Parent, PoolSize )->
@@ -66,8 +104,8 @@ init_pool( Parent, PoolSize )->
 
 master_loop( Parent, Workers )->
   receive
-    {get_workers, Ref, From}->
-      catch From ! {Ref, self(), Workers},
+    #get_pool{from = From}->
+      catch From ! #reply_pool{workers = Workers},
       master_loop( Parent, Workers );
     {'EXIT', Parent, Reason}->
       exit( Reason );

@@ -39,7 +39,6 @@
   master,
   pool,
   size,
-  batch_size,
   incarnation,        % pid of the incarnation process guarding this pool
   remote_incarnation  % remote ecall_receive master pid the pool is bound to
 }).
@@ -48,14 +47,30 @@
 -record(state,{
   node,
   parent,
-  state,        % idle | building | up
-  batch_size,
-  ref,          % ref of the get_workers request in flight, building only
-  remote,       % remote master pid of the current pool
+  state,        % request_pool | register | connected | wait_join
+  remote,       % remote ecall_receive master pid of the current pool
   incarnation,  % incarnation pid
   monitor,      % monitor ref on the incarnation
   pool          % #{ Index => Worker }
 }).
+
+% The connection master is a state machine, one master_loop/1 clause per state:
+%   request_pool: entered at start and after a join. Asks the registered
+%     ecall_receive on Node for its master and workers through erpc.
+%     Success: build_connection spawns the incarnation and the pool -> register.
+%     Any error or exception -> wait_join.
+%   register: the single persistent_term:put of the pool -> connected.
+%   connected: the pool is in use. The incarnation DOWN tears the pool down
+%     -> wait_join. The parent exit and a worker exit tear it down and exit.
+%     Everything else is dropped, joins included: a new remote master can only
+%     appear after the old one died, and the old one's exit kills the
+%     incarnation first, so the master gets to wait_join through the DOWN.
+%   wait_join: no pool. A join -> request_pool, the parent exit -> exit.
+%     Everything else is dropped.
+-define(wait_join, wait_join).
+-define(request_pool, request_pool).
+-define(register, register).
+-define(connected, connected).
 
 %%=================================================================
 %% API
@@ -129,6 +144,7 @@ call(Node, Module, Function, Args)->
 % forever, so this is the one path that checks the pool's incarnation:
 % a dead incarnation means the pool is stale and the reply goes natively,
 % routed by the pid's own creation.
+-spec call_reply(pid(), term()) -> ok.
 call_reply( ClientPID, Reply )->
   case persistent_term:get( ?KEY(node(ClientPID)), undefined ) of
     #connection{ incarnation = Incarnation } = Connection ->
@@ -144,8 +160,9 @@ call_reply( ClientPID, Reply )->
 %%=================================================================
 %% SERVICE API
 %%=================================================================
-% Ensures a connection master for the node. Asynchronous: the master fetches
-% the remote worker list in its loop, poll connection_info/1 for the result.
+% Ensures a connection master for the node. Asynchronous: the master asks the
+% registered ecall_receive on the node for its pool in its own process, poll
+% connection_info/1 for the result.
 -spec connect(node()) -> ok | {error, term()}.
 connect( Node )->
   case ecall_connection_sup:start_connection( Node ) of
@@ -154,7 +171,8 @@ connect( Node )->
   end.
 
 % Called by ecall_pg_monitor with the remote ecall_receive master pid from
-% a pg join. The master decides whether the pool has to be (re)built.
+% a pg join. Ensures the master and forwards the join; the master acts on a
+% join only in wait_join, while it has no pool.
 -spec connect(node(), pid()) -> ok | {error, term()}.
 connect( Node, RemoteMaster )->
   case ecall_connection_sup:start_connection( Node ) of
@@ -170,19 +188,17 @@ connect( Node, RemoteMaster )->
   {ok, #{
     status := connected,
     connection_pid := pid(),
-    proxy_count := pos_integer(),
-    batch_size := pos_integer()
+    proxy_count := pos_integer()
   }}
   | {ok, #{ status := down, connection_pid := pid() }}
   | {error, not_connected}.
 connection_info( Node )->
   case persistent_term:get(?KEY(Node), undefined) of
-    #connection{ master = Master, size = Size, batch_size = BatchSize }->
+    #connection{ master = Master, size = Size }->
       {ok, #{
         status => connected,
         connection_pid => Master,
-        proxy_count => Size,
-        batch_size => BatchSize
+        proxy_count => Size
       }};
     undefined->
       case ecall_connection_sup:connection_master( Node ) of
@@ -223,57 +239,71 @@ init_master( Node, Parent )->
   process_flag( priority, high ),
 
   % a no-op on a fresh start; after a master crash it removes the stale
-  % entry of the dead master before the bootstrap
+  % entry of the dead master before the first pool request
   persistent_term:erase( ?KEY(Node) ),
 
-  State = #state{ node = Node, parent = Parent, state = idle },
+  master_loop(#state{
+    node = Node,
+    parent = Parent,
+    state = ?request_pool
+  }).
 
-  % bootstrap: works after a supervisor restart and for an explicit connect/1,
-  % neither of which produces a pg join. No reply means idle until a join.
-  master_loop( request_workers( {ecall_receive, Node}, State ) ).
+master_loop(#state{
+  state = ?request_pool,
+  node = Node
+} =State)->
+  % Entered at start (a supervisor restart or an explicit connect/1, neither
+  % of which produces a join) and after a join. Always asks the registered
+  % ecall_receive on Node, never the joined pid; any failure -> wait_join.
+  % The erpc call has no timeout: it is bounded by the connection setup toward
+  % an unreachable node and by the net tick toward a hung one, and nothing is
+  % published meanwhile.
+  ?LOGINFO("requesting receive pool info from ~p",[Node]),
+  case
+    try erpc:call(Node, ecall_receive, get_pool, [])
+    catch _:E->  {error, E}
+  end of
+    {ok, {RemoteMaster, Workers}}->
+      ?LOGINFO("received pool info from ~p, activating connection",[Node]),
+      master_loop( build_connection(RemoteMaster, Workers, State) );
+    {error, Error}->
+      ?LOGWARNING("unable to get pool info from ~p, error: ~p",[Node, Error]),
+      master_loop(State#state{state = ?wait_join})
+  end;
 
-master_loop( #state{ state = idle } = State )-> idle( State );
-master_loop( #state{ state = building } = State )-> building( State );
-master_loop( #state{ state = up } = State )-> up( State ).
-
-% idle: no pool, no request in flight. Handles join and the parent exit;
-% replies and DOWNs cannot belong to this state and are dropped.
-idle( #state{ parent = Parent } = State )->
+master_loop(#state{
+  state = ?register,
+  node = Node,
+  pool = Pool,
+  incarnation = Incarnation,
+  remote = Remote
+} =State)->
+  persistent_term:put(?KEY(Node), #connection{
+    node = Node,
+    master = self(),
+    pool = Pool,
+    size = map_size( Pool ),
+    incarnation = Incarnation,
+    remote_incarnation = Remote
+  }),
+  master_loop(State#state{
+    state = ?connected
+  });
+master_loop(#state{
+  state = ?connected,
+  monitor = Monitor,
+  parent = Parent
+} =State)->
   receive
-    {join, RemoteMaster} when is_pid( RemoteMaster )->
-      master_loop( request_workers( RemoteMaster, State ) );
-    {'EXIT', Parent, Reason}->
-      exit( Reason );
-    _Stale->
-      idle( State )
-  end.
-
-% building: one get_workers request in flight. Handles the reply carrying
-% the current ref, join (a new request replaces the pending one) and the
-% parent exit; replies with a stale ref are dropped.
-building( #state{ parent = Parent, ref = Ref } = State )->
-  receive
-    {Ref, RemoteMaster, Workers} when is_pid( RemoteMaster ), is_list( Workers )->
-      master_loop( build( RemoteMaster, Workers, State ) );
-    {join, RemoteMaster} when is_pid( RemoteMaster )->
-      master_loop( request_workers( RemoteMaster, State ) );
-    {'EXIT', Parent, Reason}->
-      exit( Reason );
-    _Stale->
-      building( State )
-  end.
-
-% up: pool published. Handles join (same remote master: nothing to do,
-% another one: rebuild), the incarnation DOWN, the parent exit and a
-% worker exit (fatal, the supervisor restarts the master).
-up( #state{ parent = Parent, monitor = Monitor, remote = Remote } = State )->
-  receive
-    {join, Remote}->
-      up( State );
-    {join, RemoteMaster} when is_pid( RemoteMaster )->
-      master_loop( request_workers( RemoteMaster, invalidate( State ) ) );
     {'DOWN', Monitor, process, _Incarnation, _Reason}->
-      master_loop( invalidate( State#state{ monitor = undefined } ) );
+      teardown(State),
+      master_loop(State#state{
+        state = ?wait_join,
+        remote = undefined,
+        incarnation = undefined,
+        monitor = undefined,
+        pool = undefined
+      });
     {'EXIT', Parent, Reason}->
       teardown( State ),
       exit( Reason );
@@ -281,111 +311,92 @@ up( #state{ parent = Parent, monitor = Monitor, remote = Remote } = State )->
       teardown( State ),
       exit( {worker_down, Worker, Reason} );
     _Stale->
-      up( State )
+      master_loop( State )
+  end;
+master_loop(#state{
+  state = ?wait_join,
+  parent = Parent,
+  node = Node
+} =State)->
+  receive
+    {join, Remote}->
+      ?LOGINFO("~p joined, activating connection...",[Node]),
+      master_loop(State#state{
+        state = ?request_pool,
+        remote = Remote
+      });
+    {'EXIT', Parent, Reason}->
+      exit( Reason );
+    _Stale->
+      master_loop( State )
   end.
 
-request_workers( To, State )->
-  Ref = make_ref(),
-  catch erlang:send( To, {get_workers, Ref, self()}, [noconnect] ),
-  State#state{ state = building, ref = Ref }.
-
-% An empty remote pool (pool_size 0) cannot be routed to: stay idle on the
-% native path and wait for the next join.
-build( _RemoteMaster, [], State )->
-  State#state{ state = idle, ref = undefined };
-build( RemoteMaster, Workers, State )->
+build_connection(RemoteMaster, Workers, State)->
   case spawn_incarnation( RemoteMaster ) of
     {ok, Incarnation, Monitor}->
-      BatchSize = application:get_env(ecall, batch_size, ?BATCH_SIZE),
-      Pool =
-        maps:from_list(
-          [ {I,spawn_opt(fun()->worker_loop(W, BatchSize) end,
-                         [link, {message_queue_data, off_heap}])}
-            || {I, W} <-
-                 lists:zip(lists:seq(0, length(Workers)-1), Workers) ]),
-      State1 =
-        State#state{
-          state = up,
-          ref = undefined,
-          remote = RemoteMaster,
-          incarnation = Incarnation,
-          monitor = Monitor,
-          pool = Pool,
-          batch_size = BatchSize
-        },
-      publish( State1 ),
-      State1;
-    {error, _Reason}->
+      Pool = build_pool(Workers),
+      State#state{
+        state = ?register,
+        remote = RemoteMaster,
+        incarnation = Incarnation,
+        monitor = Monitor,
+        pool = Pool
+      };
+    {error, Reason}->
       % the remote master is already dead, wait for the next join
-      State#state{ state = idle, ref = undefined }
+      ?LOGWARNING("unable to activate connection to ~p, reason: ~p",[
+        State#state.node, Reason
+      ]),
+      State#state{state = ?wait_join}
   end.
 
-% Invalidate the current pool and go idle.
-invalidate( State )->
-  teardown( State ),
-  State#state{
-    state = idle,
-    remote = undefined,
-    incarnation = undefined,
-    monitor = undefined,
-    pool = undefined
-  }.
+build_pool(RemoteWorkers)->
+  BatchSize = application:get_env(ecall, batch_size, ?BATCH_SIZE),
+  LocalWorkers =
+    [spawn_opt(
+        fun()->
+          worker_loop(W, BatchSize)
+        end,
+        [link, {message_queue_data, off_heap}]
+      ) || W <- RemoteWorkers
+    ],
+  maps:from_list(lists:zip(lists:seq(0, length(LocalWorkers)-1), LocalWorkers)).
 
-% The incarnation goes first: exit/2 is asynchronous, so while it is still
-% monitored (its DOWN not consumed yet) wait for the DOWN. The wait is bounded,
-% kill is untrappable, and belongs to the transition. Then the entry is
-% erased, so get_proxy stops handing out proxies before they die.
+% The entry is erased before the pool is killed, so get_proxy stops handing
+% out proxies before they die. The incarnation is not touched: on the DOWN
+% path it is already dead, on the exit paths it dies through its monitor on
+% the master.
 teardown( #state{
   node = Node,
-  incarnation = Incarnation,
-  monitor = Monitor,
   pool = Pool
 } )->
-  if
-    is_reference( Monitor )->
-      exit( Incarnation, kill ),
-      receive
-        {'DOWN', Monitor, process, Incarnation, _Reason}-> ok
-      end;
-    true->
-      ok
-  end,
+  ?LOGWARNING("stop connection to ~p",[Node]),
   persistent_term:erase( ?KEY(Node) ),
   kill_pool( Pool ).
 
 % Callers waiting in call/4 monitor their proxy and get
 % {error, {badrpc, noconnection}}, the same as erpc on a lost connection.
 kill_pool( Pool )->
-  [ begin unlink( W ), exit( W, noconnection ) end || W <- maps:values( Pool ) ],
+  [ begin
+      unlink( W ),
+      exit( W, noconnection )
+    end || W <- maps:values( Pool ) ],
   ok.
-
-publish( #state{
-  node = Node,
-  pool = Pool,
-  batch_size = BatchSize,
-  incarnation = Incarnation,
-  remote = Remote
-} )->
-  persistent_term:put(?KEY(Node), #connection{
-    node = Node,
-    master = self(),
-    pool = Pool,
-    size = map_size( Pool ),
-    batch_size = BatchSize,
-    incarnation = Incarnation,
-    remote_incarnation = Remote
-  }).
 
 %%=================================================================
 %% INCARNATION
 %%=================================================================
 % The wait for ready is local and bounded (the incarnation either reports
-% or dies) and belongs to the building -> up transition.
+% or dies) and belongs to the request_pool -> register transition.
 spawn_incarnation( RemoteMaster )->
   Master = self(),
   {Incarnation, Monitor} =
-    spawn_opt(fun()-> incarnation( Master, RemoteMaster ) end,
-              [monitor, {priority, high}]),
+    spawn_opt(
+      fun()->
+        incarnation( Master, RemoteMaster )
+      end,
+      [monitor, {priority, high}]
+    ),
   receive
     {ready, Incarnation}->
       {ok, Incarnation, Monitor};
