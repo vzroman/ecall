@@ -5,16 +5,20 @@
 
 -behaviour(supervisor).
 
+%% OTP API
 -export([
   start_link/1,
   init/1
 ]).
 
+-spec start_link(ecall_receive:pool_size()) -> supervisor:startlink_ret().
 start_link( PoolSize ) ->
     supervisor:start_link(?MODULE, [ PoolSize ]).
 
 % PoolSize is a validated pool_size: a positive integer or disabled, in which
 % case the node runs without a receive pool and is invisible to its neighbours.
+-spec init([ecall_receive:pool_size()]) ->
+  {ok, {supervisor:sup_flags(), [supervisor:child_spec()]}}.
 init([ PoolSize ]) ->
 
   PG = #{

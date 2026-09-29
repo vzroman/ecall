@@ -18,21 +18,29 @@
   start_link/1
 ]).
 
+-export_type([pool_size/0, request/0]).
+
+-type pool_size() :: pos_integer() | disabled.
+-type request() ::
+  {send, erlang:send_destination(), term()}
+  | {cast, module(), atom(), [term()]}
+  | {call, reference(), pid(), module(), atom(), [term()]}.
+
 -record(state,{}).
 % request of get_pool/0 to the receive master
 -record(get_pool,{
-  from
+  from :: pid()
 }).
 % reply of the receive master to get_pool/0
 -record(reply_pool,{
-  workers
+  workers :: nonempty_list(pid())
 }).
 
 %%=================================================================
 %% API
 %%=================================================================
 % The single validator of pool_size, called once by ecall_app at start.
--spec pool_size() -> pos_integer() | disabled | {error, {invalid_pool_size, term()}}.
+-spec pool_size() -> pool_size() | {error, {invalid_pool_size, term()}}.
 pool_size()->
   case application:get_env(ecall, pool_size) of
     undefined->
@@ -51,7 +59,7 @@ pool_size()->
 % receive master pid, which the remote incarnation process links to, and the
 % workers. not_active: there is no receive pool on this node (pool_size
 % disabled or ecall not started).
--spec get_pool() -> {ok, {pid(), [pid()]}} | {error, term()}.
+-spec get_pool() -> {ok, {pid(), nonempty_list(pid())}} | {error, term()}.
 get_pool()->
   case whereis(?MODULE) of
     Master when is_pid(Master) ->
@@ -67,6 +75,7 @@ get_pool()->
       {error, not_active}
   end.
 
+-spec default_pool_size() -> pos_integer().
 default_pool_size()->
   case erlang:system_info( logical_processors ) of
     unknown-> erlang:system_info( schedulers );
@@ -76,6 +85,8 @@ default_pool_size()->
 %%=================================================================
 %% OTP API
 %%=================================================================
+-spec start_link(pos_integer()) ->
+  {ok, pid()} | {error, {already_started, pid()}}.
 start_link( PoolSize )->
   case whereis( ?MODULE ) of
     PID when is_pid( PID )->
@@ -85,6 +96,7 @@ start_link( PoolSize )->
       {ok, spawn_link(fun()-> init_pool( Parent, PoolSize ) end)}
   end.
 
+-spec init_pool(pid(), pos_integer()) -> no_return().
 init_pool( Parent, PoolSize )->
 
   % Remote connections link their incarnation processes to this master,
@@ -102,6 +114,7 @@ init_pool( Parent, PoolSize )->
 
   master_loop( Parent, Workers ).
 
+-spec master_loop(pid(), nonempty_list(pid())) -> no_return().
 master_loop( Parent, Workers )->
   receive
     #get_pool{from = From}->
@@ -122,6 +135,7 @@ master_loop( Parent, Workers )->
   end.
 
 
+-spec worker_loop(#state{}) -> no_return().
 worker_loop( State )->
   receive
     {batch, Batch}->
@@ -143,6 +157,7 @@ worker_loop( State )->
 %%=================================================================
 %% REMOTE API
 %%=================================================================
+-spec handle_batch([request()], #state{}) -> #state{}.
 handle_batch([{send, To, Message}| Rest], State)->
   catch To ! Message,
   handle_batch( Rest, State );

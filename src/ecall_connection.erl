@@ -32,27 +32,30 @@
 
 -define(KEY(Node), {?MODULE, Node}).
 
+-type proxy_pool() :: #{non_neg_integer() => pid()}.
+-type connection_state() :: request_pool | register | connected | wait_join.
+
 % The record published in persistent_term under {?MODULE, Node}, only while
 % the pool is up. It is written only by the connection master of that node.
 -record(connection,{
-  node,
-  master,
-  pool,
-  size,
-  incarnation,        % pid of the incarnation process guarding this pool
-  remote_incarnation  % remote ecall_receive master pid the pool is bound to
+  node :: node(),
+  master :: pid(),
+  pool :: proxy_pool(),
+  size :: pos_integer(),
+  incarnation :: pid(),       % incarnation process guarding this pool
+  remote_incarnation :: pid() % remote receive master the pool is bound to
 }).
 
 % connection master state
 -record(state,{
-  node,
-  parent,
-  state,        % request_pool | register | connected | wait_join
-  remote,       % remote ecall_receive master pid of the current pool
-  incarnation,  % incarnation pid
-  monitor,      % monitor ref on the incarnation
-  pool,         % #{ Index => Worker }
-  pending_join  % pid of a join received while connected, acted on in wait_join
+  node :: node(),
+  parent :: pid(),
+  state :: connection_state(),
+  remote :: pid() | undefined,      % remote receive master of the current pool
+  incarnation :: pid() | undefined,
+  monitor :: reference() | undefined,
+  pool :: proxy_pool() | undefined,
+  pending_join :: pid() | undefined % join while connected, acted on in wait_join
 }).
 
 % The connection master is a state machine, one master_loop/1 clause per state:
@@ -79,6 +82,7 @@
 %%=================================================================
 %% API
 %%=================================================================
+-spec send(erlang:send_destination(), Message) -> Message when Message :: term().
 send( To, Message )->
   case get_proxy( To ) of
     undefined ->
@@ -88,6 +92,7 @@ send( To, Message )->
       Message
   end.
 
+-spec cast(node(), module(), atom(), [term()]) -> ok.
 cast(Node, Module, Function, Args)->
   case get_node_proxy( Node ) of
     undefined ->
@@ -114,6 +119,8 @@ cast(Node, Module, Function, Args)->
 % The caller monitors its proxy: the proxies of a connection are killed with
 % reason noconnection when the connection goes down, so a call never hangs on
 % a dead connection, it returns {error, {badrpc, noconnection}}.
+-spec call(node(), module(), atom(), [term()]) ->
+  {ok, term()} | {error, term()}.
 call(Node, Module, Function, Args)->
   case get_node_proxy( Node ) of
     undefined ->
@@ -237,6 +244,7 @@ start_link( Node )->
 %%=================================================================
 %% CONNECTION MASTER
 %%=================================================================
+-spec init_master(node(), pid()) -> no_return().
 init_master( Node, Parent )->
 
   process_flag( trap_exit, true ),
@@ -252,6 +260,7 @@ init_master( Node, Parent )->
     state = ?request_pool
   }).
 
+-spec master_loop(#state{}) -> no_return().
 master_loop(#state{
   state = ?request_pool,
   node = Node
@@ -353,6 +362,7 @@ master_loop(#state{
       master_loop( State )
   end.
 
+-spec build_connection(pid(), nonempty_list(pid()), #state{}) -> #state{}.
 build_connection(RemoteMaster, Workers, State)->
   case spawn_incarnation( RemoteMaster ) of
     {ok, Incarnation, Monitor}->
@@ -372,6 +382,7 @@ build_connection(RemoteMaster, Workers, State)->
       State#state{state = ?wait_join}
   end.
 
+-spec build_pool(nonempty_list(pid())) -> proxy_pool().
 build_pool(RemoteWorkers)->
   BatchSize = application:get_env(ecall, batch_size, ?BATCH_SIZE),
   LocalWorkers =
@@ -388,6 +399,7 @@ build_pool(RemoteWorkers)->
 % out proxies before they die. The incarnation is not touched: on the DOWN
 % path it is already dead, on the exit paths it dies through its monitor on
 % the master.
+-spec teardown(#state{pool :: proxy_pool()}) -> ok.
 teardown( #state{
   node = Node,
   pool = Pool
@@ -398,6 +410,7 @@ teardown( #state{
 
 % Callers waiting in call/4 monitor their proxy and get
 % {error, {badrpc, noconnection}}, the same as erpc on a lost connection.
+-spec kill_pool(proxy_pool()) -> ok.
 kill_pool( Pool )->
   [ begin
       unlink( W ),
@@ -410,12 +423,25 @@ kill_pool( Pool )->
 %%=================================================================
 % The wait for ready is local and bounded (the incarnation either reports
 % or dies) and belongs to the request_pool -> register transition.
+-spec spawn_incarnation(pid()) ->
+  {ok, pid(), reference()} | {error, term()}.
 spawn_incarnation( RemoteMaster )->
   Master = self(),
   {Incarnation, Monitor} =
     spawn_opt(
       fun()->
-        incarnation( Master, RemoteMaster )
+        % Lives exactly as long as the remote receive master is reachable.
+        % A link exit terminates this process inside signal handling, so
+        % is_process_alive callers queued behind the exit signal get false.
+        % It must never receive messages: the is_process_alive fast path
+        % needs an empty signal queue.
+        MasterMonitor = erlang:monitor( process, Master ),
+        link( RemoteMaster ),
+        Master ! {ready, self()},
+        receive
+          {'DOWN', MasterMonitor, process, Master, _Reason}->
+            exit( shutdown )
+        end
       end,
       [monitor, {priority, high}]
     ),
@@ -426,29 +452,18 @@ spawn_incarnation( RemoteMaster )->
       {error, Reason}
   end.
 
-% Lives exactly as long as the remote receive master is reachable.
-% A link, not a monitor: a link exit terminates this process inside signal
-% handling, so is_process_alive callers queued behind the exit signal get false.
-% It must never receive messages: the is_process_alive fast path needs an
-% empty signal queue.
-incarnation( Master, RemoteMaster )->
-  MasterMonitor = erlang:monitor( process, Master ),
-  link( RemoteMaster ),
-  Master ! {ready, self()},
-  receive
-    {'DOWN', MasterMonitor, process, Master, _Reason}->
-      exit( shutdown )
-  end.
-
 %%=================================================================
 %% WORKER LOOP
 %%=================================================================
+-spec worker_loop(pid(), pos_integer()) -> no_return().
 worker_loop( Remote, BatchSize )->
   erlang:garbage_collect(self()),
   Requests = collect_requests( _Count = 0, BatchSize ),
   catch Remote ! {batch, Requests},
   worker_loop( Remote, BatchSize ).
 
+-spec collect_requests(non_neg_integer(), pos_integer()) ->
+  [ecall_receive:request()].
 collect_requests( Count, BatchSize ) when 0 < Count, Count < BatchSize->
   receive
     {do, Request}-> [Request| collect_requests( Count + 1, BatchSize)]
@@ -465,6 +480,8 @@ collect_requests( _Count, _BatchSize )->
 %%=================================================================
 %% UTILITIES
 %%=================================================================
+-spec get_proxy(erlang:send_destination()) ->
+  {pid(), pid() | atom()} | undefined.
 get_proxy({ Service, Node }) ->
   case get_node_proxy( Node ) of
     undefined ->
@@ -483,6 +500,7 @@ get_proxy( _To )->
   undefined.
 
 % Plain lookup: the entry exists only while the pool is up.
+-spec get_node_proxy(node()) -> pid() | undefined.
 get_node_proxy( Node )->
   case persistent_term:get(?KEY(Node), undefined) of
     #connection{} = Connection ->
@@ -491,6 +509,7 @@ get_node_proxy( Node )->
       undefined
   end.
 
+-spec pick_worker(#connection{}) -> pid().
 pick_worker(#connection{ size = Size, pool = Pool })->
   I = erlang:phash2(self(), Size),
   maps:get(I, Pool ).

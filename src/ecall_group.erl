@@ -15,6 +15,12 @@
   cast_all/4
 ]).
 
+-type pending_calls() :: #{reference() => node()}.
+-type call_mfa() :: {module(), atom(), [term()]}.
+-type node_result() :: {node(), term()}.
+-type single_result() ::
+  {ok, node_result()} | {error, none_is_available | [node_result()]}.
+
 -define(RAND(List),
   begin
     _@I = erlang:phash2(make_ref(),length(List)),
@@ -48,6 +54,8 @@ call_one(Ns,M,F,As,RpcErr) ->
       call_one(Ns,M,F,As,[],RpcErr)
   end.
 
+-spec call_one([node()], module(), atom(), [term()], [node_result()], boolean()) ->
+  {ok, node_result()} | {error, [node_result()]}.
 call_one([],_M,_F,_As,Errors,_RpcErr)->
   {error,Errors};
 call_one( Ns,M,F,As,Errors,RpcErr)->
@@ -92,11 +100,14 @@ call_any(Ns,M,F,As,RpcErr)->
       do_call_any(Ns, {M,F,As}, [], RpcErr, [Ns,M,F,As,RpcErr])
   end.
 
+-spec do_call_any([node()], call_mfa(), [node_result()], boolean(), [term()]) ->
+  single_result().
 do_call_any(Ns, MFA, Errors, RpcErr, Args)->
   group_call(call_any, Args, fun()->
     wait_any(spawn_callers(Ns, MFA), Errors, RpcErr)
   end).
 
+-spec wait_any(pending_calls(), [node_result()], boolean()) -> single_result().
 wait_any(Pending, Errors, RpcErr) when map_size(Pending) > 0 ->
   receive
     {'DOWN', Ref, process, _Caller, Reason}->
@@ -130,6 +141,8 @@ call_all(Ns,M,F,As,RpcErr)->
     wait_all(spawn_callers(Ns, {M,F,As}), [], RpcErr)
   end).
 
+-spec wait_all(pending_calls(), [node_result()], boolean()) ->
+  {ok, [node_result()]} | {error, none_is_available | node_result()}.
 wait_all(Pending, OKs, RpcErr) when map_size(Pending) > 0 ->
   receive
     {'DOWN', Ref, process, _Caller, Reason}->
@@ -158,6 +171,8 @@ call_all_wait(Ns,M,F,As)->
     wait_all_wait(spawn_callers(Ns, {M,F,As}), [], [])
   end).
 
+-spec wait_all_wait(pending_calls(), [node_result()], [node_result()]) ->
+  {[node_result()], [node_result()]}.
 wait_all_wait(Pending, Replies, Rejects) when map_size(Pending) > 0 ->
   receive
     {'DOWN', Ref, process, _Caller, Reason}->
@@ -173,6 +188,8 @@ wait_all_wait(_Pending, Replies, Rejects)->
   {lists:reverse(Replies), lists:reverse(Rejects)}.
 
 %-----------group call protocol----------------------------------
+-spec group_call(atom(), [term()], fun(() -> Result)) -> Result
+  when Result :: term().
 group_call(Function, Args, Call)->
   {Master, MRef} = spawn_monitor(fun()->
     Reply = Call(),
@@ -186,6 +203,7 @@ group_call(Function, Args, Call)->
       exit({Reason, {ecall, Function, Args}})
   end.
 
+-spec spawn_callers([node()], call_mfa()) -> pending_calls().
 spawn_callers(Ns, {M,F,As})->
   maps:from_list([
     begin
@@ -198,6 +216,7 @@ spawn_callers(Ns, {M,F,As})->
     end || N <- Ns
   ]).
 
+-spec caller_result(term()) -> {ok, term()} | {error, term()}.
 caller_result({ecall_result, {ok, _Value} = Result})->
   Result;
 caller_result({ecall_result, {error, _Error} = Result})->
@@ -206,7 +225,7 @@ caller_result(Reason)->
   {error, {badrpc, Reason}}.
 
 %-------------CAST------------------------------------------
--spec cast_one([node()], module(), atom(), [term()]) -> ok.
+-spec cast_one(nonempty_list(node()), module(), atom(), [term()]) -> ok.
 cast_one(Ns,M,F,As)->
   N =
     case lists:member(node(), Ns) of

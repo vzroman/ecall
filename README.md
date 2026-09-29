@@ -379,6 +379,7 @@ The repository has two independent test layers: fast unit suites that run on one
 
 ```sh
 make compile             # ./rebar3 compile
+make dialyzer            # static type analysis
 make test                # unit suites
 make performance_tests   # distributed performance suite
 make performance_report  # build and serve the report over the collected runs

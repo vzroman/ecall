@@ -5,21 +5,25 @@
 
 -behaviour(supervisor).
 
+%% OTP API
 -export([
   start_link/0,
   init/1
 ]).
 
+%% CONNECTION API
 -export([
   start_connection/1,
   stop_connection/1,
   connection_master/1
 ]).
 
+-spec start_link() -> supervisor:startlink_ret().
 start_link() ->
   supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 
+-spec init([]) -> {ok, {supervisor:sup_flags(), []}}.
 init([]) ->
 
   Supervisor=#{
@@ -48,6 +52,7 @@ start_connection( Node )->
     {error, Error} -> {error, Error}
   end.
 
+-spec restart_connection(node()) -> {ok, pid()} | {error, term()}.
 restart_connection( Node )->
   case supervisor:restart_child(?MODULE, Node) of
     {ok, Pid}-> {ok, Pid};

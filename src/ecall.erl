@@ -27,7 +27,7 @@
 %%=================================================================
 %% SINGLE NODE API
 %%=================================================================
--spec send(term(), term()) -> term().
+-spec send(erlang:send_destination(), Message) -> Message when Message :: term().
 send(To, Message) ->
   ecall_connection:send(To, Message).
 
@@ -78,7 +78,7 @@ call_all(Nodes, Module, Function, Args, RpcErr) ->
 call_all_wait(Nodes, Module, Function, Args) ->
   ecall_group:call_all_wait(Nodes, Module, Function, Args).
 
--spec cast_one([node()], module(), atom(), [term()]) -> ok.
+-spec cast_one(nonempty_list(node()), module(), atom(), [term()]) -> ok.
 cast_one(Nodes, Module, Function, Args) ->
   ecall_group:cast_one(Nodes, Module, Function, Args).
 

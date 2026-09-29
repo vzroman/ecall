@@ -21,10 +21,13 @@
 %%=================================================================
 %%	OTP
 %%=================================================================
+-spec start_link() -> gen_server:start_ret().
 start_link()->
   gen_server:start_link({local,?MODULE},?MODULE, [], []).
 
--record(state,{ref}).
+-record(state,{ref :: reference()}).
+
+-spec init([]) -> {ok, #state{}}.
 init([])->
 
   process_flag(trap_exit,true),
@@ -35,16 +38,19 @@ init([])->
 
   {ok,#state{ ref = Ref}}.
 
+-spec handle_call(term(), gen_server:from(), #state{}) -> {noreply, #state{}}.
 handle_call(Request, From, State) ->
   ?LOGWARNING("unexpected call resquest ~p from ~p",[Request,From]),
   {noreply,State}.
 
+-spec handle_cast(term(), #state{}) -> {noreply, #state{}}.
 handle_cast(Request,State)->
   ?LOGWARNING("unexpected cast resquest ~p",[Request]),
   {noreply,State}.
 
 % A joined member is a remote ecall_receive master: the connection master
 % of its node acts on a join only while it waits for a pool.
+-spec handle_info(term(), #state{}) -> {noreply, #state{}}.
 handle_info({Ref, join, ?pg_group, Neighbours}, #state{ ref = Ref} = State)->
 
   [ try
@@ -69,12 +75,13 @@ handle_info(Message,State)->
   ?LOGWARNING("unexpected info message ~p",[Message]),
   {noreply,State}.
 
+-spec terminate(term(), #state{}) -> ok.
 terminate(_Reason,_State)->
   ok.
 
+-spec code_change(term(), #state{}, term()) -> {ok, #state{}}.
 code_change(_OldVsn, State, _Extra) ->
   {ok, State}.
-
 
 
 
