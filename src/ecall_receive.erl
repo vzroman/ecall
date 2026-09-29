@@ -160,7 +160,7 @@ worker_loop( State )->
 %%=================================================================
 -spec handle_batch([request()], #state{}) -> #state{}.
 handle_batch([{send, To, Message}| Rest], State)->
-  try To ! Message catch error:badarg -> ok end,
+  try To ! Message catch _:_ -> ok end,
   handle_batch( Rest, State );
 handle_batch([{cast, Module, Function, Args}| Rest], State)->
   spawn(Module, Function, Args ),
