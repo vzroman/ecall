@@ -1,10 +1,10 @@
 .PHONY: compile dialyzer clean_logs clean_build clean_all test performance_tests performance_report clean_tests shell
 
 compile:
-	./rebar3 compile
+	rebar3 compile
 
 dialyzer:
-	./rebar3 dialyzer
+	rebar3 dialyzer
 
 clean_logs:
 	rm -rf logs
@@ -16,10 +16,10 @@ clean_build:
 clean_all: clean_logs clean_build
 
 test:
-	./rebar3 ct --sname ecall_ct --suite test/ecall_app_SUITE.erl,test/ecall_receive_SUITE.erl,test/ecall_connection_SUITE.erl,test/ecall_reincarnation_SUITE.erl,test/ecall_group_SUITE.erl
+	rebar3 ct --cover --sname ecall_ct --suite test/ecall_app_SUITE.erl,test/ecall_receive_SUITE.erl,test/ecall_connection_SUITE.erl,test/ecall_reincarnation_SUITE.erl,test/ecall_group_SUITE.erl
 
 performance_tests: compile
-	./rebar3 ct --spec=./test/performance/test.spec
+	rebar3 ct --spec=./test/performance/test.spec
 
 performance_report:
 	cd performance_report && npm install
@@ -30,4 +30,4 @@ clean_tests:
 	rm -rf _build/test
 
 shell:
-	ERL_FLAGS="-args_file config/vm.args -config config/sys.config" ./rebar3 shell
+	ERL_FLAGS="-args_file config/vm.args -config config/sys.config" rebar3 shell

@@ -1,6 +1,10 @@
 # ecall
 
+[![CI](https://github.com/vzroman/ecall/actions/workflows/ci.yml/badge.svg)](https://github.com/vzroman/ecall/actions/workflows/ci.yml) [![Hex.pm](https://img.shields.io/hexpm/v/ecall.svg)](https://hex.pm/packages/ecall) [![Hex Docs](https://img.shields.io/badge/hex-docs-lightgreen.svg)](https://hexdocs.pm/ecall/) [![codecov](https://codecov.io/gh/vzroman/ecall/branch/main/graph/badge.svg)](https://codecov.io/gh/vzroman/ecall)
+
 Pooled, batched transport for Erlang distribution, with `send`, `cast` and `call` on top of it and a set of multi-node call and cast patterns (`call_one`, `call_any`, `call_all`, `call_all_wait`, `cast_one`, `cast_all`).
+
+Requires Erlang/OTP 27 or later. CI runs 27, 28 and 29.
 
 - [The problem](#the-problem)
 - [What ecall does](#what-ecall-does)
@@ -57,7 +61,7 @@ The usual knobs do not change this:
 - `process_flag(async_dist, true)` removes the suspension and nothing else. Without flow control memory grows until the VM is killed, which the [documentation](https://www.erlang.org/doc/apps/erts/erlang.html#process_flag_async_dist) warns about.
 - `erpc` is not the problem and not the fix. An `erpc:cast/4` or `erpc:call/4` travels through the same queue as a plain send, as a spawn request that is heavier on both ends.
 
-The full analysis, with lock profiles and everything that was tried, is in [the article](docs/article.md).
+The full analysis, with lock profiles and everything that was tried, is in [the article](https://github.com/vzroman/ecall/blob/main/docs/article.md).
 
 ## What ecall does
 
@@ -77,7 +81,7 @@ The proxy loop is the whole idea:
 worker_loop(Remote, BatchSize) ->
   erlang:garbage_collect(self()),
   Requests = collect_requests(0, BatchSize),
-  catch Remote ! {batch, Requests},
+  Remote ! {batch, Requests},
   worker_loop(Remote, BatchSize).
 
 collect_requests(0, BatchSize) ->
@@ -162,7 +166,15 @@ Add ecall as a rebar3 dependency:
 
 ```erlang
 {deps, [
-  {ecall, {git, "https://github.com/vzroman/ecall.git", {branch, "main"}}}
+  {ecall, "0.1.0"}
+]}.
+```
+
+or from git:
+
+```erlang
+{deps, [
+  {ecall, {git, "https://github.com/vzroman/ecall.git", {tag, "v0.1.0"}}}
 ]}.
 ```
 
@@ -378,7 +390,7 @@ For `call_any/4,5`, `call_all/4,5` and `call_all_wait/4`, a killed per-node call
 The repository has two independent test layers: fast unit suites that run on one machine, and a distributed performance suite that drives two Docker-hosted nodes and produces the JSON behind the tables above.
 
 ```sh
-make compile             # ./rebar3 compile
+make compile             # rebar3 compile
 make dialyzer            # static type analysis
 make test                # unit suites
 make performance_tests   # distributed performance suite
@@ -405,7 +417,7 @@ Runs five Common Test suites: `ecall_app_SUITE` (`pool_size` validation at appli
 make performance_tests
 ```
 
-Compiles and then runs `./rebar3 ct --spec=./test/performance/test.spec`. The machine running this command is the *controller*: it does not generate load itself. It starts one sender node and one receiver node as `peer` nodes inside Docker containers, connects them, starts ecall on both, waits for the ecall pools to connect in both directions, and then drives every point of the matrix over Common Test.
+Compiles and then runs `rebar3 ct --spec=./test/performance/test.spec`. The machine running this command is the *controller*: it does not generate load itself. It starts one sender node and one receiver node as `peer` nodes inside Docker containers, connects them, starts ecall on both, waits for the ecall pools to connect in both directions, and then drives every point of the matrix over Common Test.
 
 
 #### Requirements

@@ -119,7 +119,7 @@ init_pool( Parent, PoolSize )->
 master_loop( Parent, Workers )->
   receive
     #get_pool{from = From}->
-      catch From ! #reply_pool{workers = Workers},
+      From ! #reply_pool{workers = Workers},
       master_loop( Parent, Workers );
     {'EXIT', Parent, Reason}->
       exit( Reason );
@@ -146,7 +146,7 @@ worker_loop( State )->
     {{'DOWN', Ref, ClientPID}, _MonRef, process, _PID, Reason}->
       if
         Reason =/= normal->
-          catch ecall_connection:call_reply(ClientPID, {'DOWN', Ref, Reason});
+          ecall_connection:call_reply(ClientPID, {'DOWN', Ref, Reason});
         true ->
           ignore
       end,
@@ -160,7 +160,7 @@ worker_loop( State )->
 %%=================================================================
 -spec handle_batch([request()], #state{}) -> #state{}.
 handle_batch([{send, To, Message}| Rest], State)->
-  catch To ! Message,
+  try To ! Message catch _:_ -> ok end,
   handle_batch( Rest, State );
 handle_batch([{cast, Module, Function, Args}| Rest], State)->
   spawn(Module, Function, Args ),
