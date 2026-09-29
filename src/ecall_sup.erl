@@ -1,5 +1,6 @@
 
 -module(ecall_sup).
+-moduledoc false.
 
 -include("ecall.hrl").
 

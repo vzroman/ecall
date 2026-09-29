@@ -1,5 +1,6 @@
 
 -module(ecall_receive).
+-moduledoc false.
 
 -include("ecall.hrl").
 

@@ -1,5 +1,6 @@
 
 -module(ecall_pg_monitor).
+-moduledoc false.
 
 -include("ecall.hrl").
 

@@ -1,6 +1,6 @@
 -module(ecall_group).
+-moduledoc false.
 
-%% @private
 %% Group operation implementation. Application callers use the ecall facade.
 
 %%=================================================================

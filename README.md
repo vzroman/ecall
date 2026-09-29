@@ -263,7 +263,7 @@ Note that a function returning `{ok, X}` produces `{ok, {ok, X}}`. The conventio
 
 ### Group functions
 
-The group functions apply the same MFA to a list of nodes with a policy about which nodes to use and how many answers to wait for. The called function follows the same convention: `{error, Reason}` is a rejection, any other value is a success. A node that cannot be reached, or on which the function crashed, yields `{badrpc, Reason}` as its error. By default such nodes are ignored, as if they were not in the list; the optional fifth argument `RpcErr = true` makes them count as ordinary errors, which is what you want when "unreachable" is itself a decision-relevant answer.
+The group functions apply the same MFA to a list of nodes with a policy about which nodes to use and how many answers to wait for. The called function follows the same convention: `{error, Reason}` is a rejection, any other value is a success, and a function that crashes yields the ordinary rejection `{error, {exit, Reason}}`. A node that cannot be reached yields `{badrpc, Reason}` as its error. By default such nodes are ignored, as if they were not in the list; the optional fifth argument `RpcErr = true` makes them count as ordinary errors, which is what you want when "unreachable" is itself a decision-relevant answer.
 
 For `call_any`, `call_all` and `call_all_wait`, a per-node caller process killed on the calling node counts as `{badrpc, Reason}` for that node. If the master process coordinating the group call is killed or crashes, the function raises `exit({Reason, {ecall, Function, Args}})`.
 

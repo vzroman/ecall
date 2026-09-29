@@ -1,5 +1,6 @@
 
 -module(ecall_app).
+-moduledoc false.
 
 -behaviour(application).
 
