@@ -1,235 +1,107 @@
-
 -module(ecall).
 
--include("ecall.hrl").
+%% Public application API. Transport and group policies live in internal modules.
 
 %%=================================================================
-%% API
+%% SINGLE NODE API
+%%=================================================================
+-export([send/2, cast/4, call/4]).
+
+%%=================================================================
+%% GROUP API
 %%=================================================================
 -export([
-  send/2,
-  cast/4,
-  call/4,
-
-  call_one/4,call_one/5,
-  call_any/4,call_any/5,
-  call_all/4,call_all/5,
+  call_one/4, call_one/5,
+  call_any/4, call_any/5,
+  call_all/4, call_all/5,
   call_all_wait/4,
-
   cast_one/4,
-  cast_all/4,
-
-  start_connection/1,
-  stop_connection/1,
-  connection_info/1
+  cast_all/4
 ]).
 
--define(RAND(List),
-  begin
-    _@I = erlang:phash2(make_ref(),length(List)),
-    lists:nth(_@I+1, List)
-  end).
+%%=================================================================
+%% CONNECTION API
+%%=================================================================
+-export([start_connection/1, stop_connection/1, connection_info/1]).
 
-%===========================================================
-%   SINGLE NODE API
-%===========================================================
-send(To, Message)->
+%%=================================================================
+%% SINGLE NODE API
+%%=================================================================
+-spec send(term(), term()) -> term().
+send(To, Message) ->
   ecall_connection:send(To, Message).
 
-cast( Node, Module, Function, Args )->
-  ecall_connection:cast( Node, Module, Function, Args ).
+-spec cast(node(), module(), atom(), [term()]) -> ok.
+cast(Node, Module, Function, Args) ->
+  ecall_connection:cast(Node, Module, Function, Args).
 
-call( Node, Module, Function, Args )->
-  ecall_connection:call( Node, Module, Function, Args ).
+-spec call(node(), module(), atom(), [term()]) ->
+  {ok, term()} | {error, term()}.
+call(Node, Module, Function, Args) ->
+  ecall_connection:call(Node, Module, Function, Args).
 
-%===========================================================
-%   CALLS
-%===========================================================
-%-----------call one----------------------------------------
-call_one(Ns,M,F,As) ->
-  call_one(Ns,M,F,As,_RpcErr = false).
-call_one([],_M,_F,_As,_RpcErr) ->
-  {error,none_is_available};
-call_one(Ns,M,F,As,RpcErr) ->
-  N = node(),
-  case lists:member(N, Ns) of
-    true ->
-      case ecall_connection:call(N, M, F, As) of
-        {ok,Result}->
-          {ok,{N,Result}};
-        {error,Error}->
-          call_one( Ns --[N], M, F, As, [{N,Error}], RpcErr)
-      end;
-    false->
-      call_one(Ns,M,F,As,[],RpcErr)
-  end.
+%%=================================================================
+%% GROUP API
+%%=================================================================
+-spec call_one([node()], module(), atom(), [term()]) ->
+  {ok, {node(), term()}} | {error, none_is_available | [{node(), term()}]}.
+call_one(Nodes, Module, Function, Args) ->
+  ecall_group:call_one(Nodes, Module, Function, Args).
 
-call_one([],_M,_F,_As,Errors,_RpcErr)->
-  {error,Errors};
-call_one( Ns,M,F,As,Errors,RpcErr)->
-  N = ?RAND( Ns ),
-  case ecall_connection:call(N, M, F, As) of
-    {ok,Result}->
-      {ok,{N,Result}};
-    {error, Error}->
-      Errors1 =
-        case Error of
-          {badrpc, _Reason} when not RpcErr ->
-            Errors;
-          _->
-            [{N,Error} | Errors]
-        end,
-      call_one( Ns --[N], M, F, As, Errors1, RpcErr)
-  end.
+-spec call_one([node()], module(), atom(), [term()], boolean()) ->
+  {ok, {node(), term()}} | {error, none_is_available | [{node(), term()}]}.
+call_one(Nodes, Module, Function, Args, RpcErr) ->
+  ecall_group:call_one(Nodes, Module, Function, Args, RpcErr).
 
-%-----------call any----------------------------------------
-call_any(Ns,M,F,As) ->
-  call_any(Ns,M,F,As,_RpcErr = false).
-call_any([],_M,_F,_As,_RpcErr)->
-  {error,none_is_available};
-call_any(Ns,M,F,As,RpcErr)->
-  N = node(),
-  case lists:member(N, Ns) of
-    true ->
-      case ecall_connection:call(N, M, F, As) of
-        {ok,Result}->
-          cast_all(Ns -- [N], M, F, As),
-          {ok,{N,Result}};
-        {error,Error}->
-          do_call_any( Ns --[N], M, F, As, [{N,Error}], RpcErr)
-      end;
-    false->
-      do_call_any(Ns,M,F,As,[],RpcErr)
-  end.
+-spec call_any([node()], module(), atom(), [term()]) ->
+  {ok, {node(), term()}} | {error, none_is_available | [{node(), term()}]}.
+call_any(Nodes, Module, Function, Args) ->
+  ecall_group:call_any(Nodes, Module, Function, Args).
 
-do_call_any(Ns,M,F,As,Errors,RpcErr)->
-  Owner = self(),
-  Master = spawn(fun()->async_call_any(Owner,Ns,M,F,As,Errors,RpcErr) end),
-  receive
-    {ok,Master,Result}->{ok,Result};
-    {error,Master,Error}->{error,Error}
-  end.
+-spec call_any([node()], module(), atom(), [term()], boolean()) ->
+  {ok, {node(), term()}} | {error, none_is_available | [{node(), term()}]}.
+call_any(Nodes, Module, Function, Args, RpcErr) ->
+  ecall_group:call_any(Nodes, Module, Function, Args, RpcErr).
 
-async_call_any(Owner,Ns,M,F,As,Errors,RpcErr)->
-  Master = self(),
-  Callers =
-    [ spawn(fun()->Master ! {N,ecall_connection:call(N, M, F, As)} end) || N <- Ns ],
-  wait_any(Owner, length(Callers), Errors, RpcErr).
+-spec call_all([node()], module(), atom(), [term()]) ->
+  {ok, [{node(), term()}]} | {error, none_is_available | {node(), term()}}.
+call_all(Nodes, Module, Function, Args) ->
+  ecall_group:call_all(Nodes, Module, Function, Args).
 
-wait_any(Owner, WaitFor, Errors, RpcErr) when WaitFor > 0 ->
-  % I'm the master
-  receive
-    {N,{ok,Result}}->
-      Owner ! {ok,self(),{N,Result}};
-    {N,{error,Error}}->
-      Errors1 =
-        case Error of
-          {badrpc, _Reason} when not RpcErr->
-            Errors;
-          _->
-            [{N, Error} | Errors]
-        end,
-      wait_any(Owner, WaitFor-1,Errors1,RpcErr)
-  end;
-wait_any(Owner, _WaitFor=0, Errors,_RpcErr)->
-  if
-    length(Errors) >0 ->
-      Owner ! {error,self(), Errors};
-    true->
-      % All were badrpc
-      Owner ! {error,self(),none_is_available}
-  end.
+-spec call_all([node()], module(), atom(), [term()], boolean()) ->
+  {ok, [{node(), term()}]} | {error, none_is_available | {node(), term()}}.
+call_all(Nodes, Module, Function, Args, RpcErr) ->
+  ecall_group:call_all(Nodes, Module, Function, Args, RpcErr).
 
-%-----------call all----------------------------------------
-call_all(Ns,M,F,As) ->
-  call_all(Ns,M,F,As,_RpcErr = false).
-call_all([],_M,_F,_As,_RpcErr)->
-  {error,none_is_available};
-call_all(Ns,M,F,As,RpcErr)->
-  Owner = self(),
-  Master = spawn(fun()->async_call_all(Owner,Ns,M,F,As,RpcErr) end),
-  receive
-    {ok,Master,Result}->{ok,Result};
-    {error,Master,Error}->{error,Error}
-  end.
-async_call_all(Owner,Ns,M,F,As,RpcErr)->
-  Master = self(),
-  Callers =
-    [ spawn(fun()->Master ! {N,ecall_connection:call(N, M, F, As)} end) || N <- Ns ],
-  wait_all(Owner, length(Callers), _OKs=[], RpcErr).
+-spec call_all_wait([node()], module(), atom(), [term()]) ->
+  {[{node(), term()}], [{node(), term()}]}.
+call_all_wait(Nodes, Module, Function, Args) ->
+  ecall_group:call_all_wait(Nodes, Module, Function, Args).
 
-wait_all(Owner, WaitFor, OKs, RpcErr) when WaitFor > 0 ->
-  % I'm the master
-  receive
-    {N,{ok,Result}}->
-      wait_all(Owner, WaitFor-1,[{N,Result}|OKs],RpcErr);
-    {N,{error,Error}}->
-      case Error of
-        {badrpc, _Reason} when not RpcErr ->
-          wait_all(Owner,WaitFor-1,OKs,RpcErr);
-        _->
-          Owner ! {error,self(), {N,Error}}
-      end
-  end;
-wait_all(Owner, _WaitFor=0, OKs,_RpcErr)->
-  if
-    length(OKs) >0 ->
-      Owner ! {ok,self(), lists:reverse(OKs)};
-    true->
-      % All were badrpc
-      Owner ! {error,self(),none_is_available}
-  end.
+-spec cast_one([node()], module(), atom(), [term()]) -> ok.
+cast_one(Nodes, Module, Function, Args) ->
+  ecall_group:cast_one(Nodes, Module, Function, Args).
 
-%-----------call all wait----------------------------------------
-call_all_wait([],_M,_F,_As)->
-  {[],[]};
-call_all_wait(Ns,M,F,As)->
-  Owner = self(),
-  Master = spawn(fun()->async_call_all_wait(Owner,Ns,M,F,As) end),
-  receive
-    {Master,OKs, Errors}->{ OKs, Errors }
-  end.
-async_call_all_wait(Owner,Ns,M,F,As)->
-  Master = self(),
-  Callers =
-    [ spawn_link(fun()->Master ! {N,ecall_connection:call(N, M, F, As)} end) || N <- Ns ],
-  wait_all_wait(Owner, length(Callers), _Replies=[],_Rejects=[]).
+-spec cast_all([node()], module(), atom(), [term()]) -> ok.
+cast_all(Nodes, Module, Function, Args) ->
+  ecall_group:cast_all(Nodes, Module, Function, Args).
 
-wait_all_wait(Owner, WaitFor, Replies, Rejects) when WaitFor > 0 ->
-  % I'm the master
-  receive
-    {N,{ok,Result}}->
-      wait_all_wait(Owner, WaitFor-1,[{N,Result}|Replies],Rejects);
-    {N,{error,E}}->
-      wait_all_wait(Owner, WaitFor-1,Replies,[{N,E}|Rejects])
-  end;
-wait_all_wait(Owner, _WaitFor=0, Replies, Rejects)->
-  Owner ! {self(), lists:reverse(Replies),lists:reverse(Rejects)}.
-
-%-------------CAST------------------------------------------
-cast_one(Ns,M,F,As)->
-  N =
-    case lists:member(node(), Ns) of
-      true -> node();
-      _-> ?RAND(Ns)
-    end,
-  ecall_connection:cast(N, M, F, As),
-  ok.
-
-cast_all(Ns,M,F,As)->
-  [ ecall_connection:cast(N, M, F, As) || N <- Ns ],
-  ok.
-
-%===========================================================
-%   CONNECTIONS
-%===========================================================
+%%=================================================================
+%% CONNECTION API
+%%=================================================================
 % Asynchronous: poll connection_info/1 for the result.
-start_connection(Node)->
+-spec start_connection(node()) -> ok | {error, term()}.
+start_connection(Node) ->
   ecall_connection:connect(Node).
 
-stop_connection(Node)->
+-spec stop_connection(node()) -> ok.
+stop_connection(Node) ->
   ecall_connection:disconnect(Node).
 
-connection_info(Node)->
+-spec connection_info(node()) ->
+  {ok, #{status := connected, connection_pid := pid(),
+         proxy_count := pos_integer()}}
+  | {ok, #{status := down, connection_pid := pid()}}
+  | {error, not_connected}.
+connection_info(Node) ->
   ecall_connection:connection_info(Node).
-

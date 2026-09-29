@@ -217,7 +217,7 @@ ecall does not form the cluster. It relies on Erlang distribution being connecte
 
 ## API
 
-All functions live in the `ecall` module. `Node` is a node name, `Nodes` is a non-empty list of node names which may include the local node, and `Module`, `Function`, `Args` are the usual MFA triple.
+The `ecall` module is the public API for callers. Other modules, including `ecall_group`, are internal implementation details. `Node` is a node name, `Nodes` is a non-empty list of node names which may include the local node, and `Module`, `Function`, `Args` are the usual MFA triple.
 
 ### Single-node functions
 
@@ -264,6 +264,8 @@ Note that a function returning `{ok, X}` produces `{ok, {ok, X}}`. The conventio
 ### Group functions
 
 The group functions apply the same MFA to a list of nodes with a policy about which nodes to use and how many answers to wait for. The called function follows the same convention: `{error, Reason}` is a rejection, any other value is a success. A node that cannot be reached, or on which the function crashed, yields `{badrpc, Reason}` as its error. By default such nodes are ignored, as if they were not in the list; the optional fifth argument `RpcErr = true` makes them count as ordinary errors, which is what you want when "unreachable" is itself a decision-relevant answer.
+
+For `call_any`, `call_all` and `call_all_wait`, a per-node caller process killed on the calling node counts as `{badrpc, Reason}` for that node. If the master process coordinating the group call is killed or crashes, the function raises `exit({Reason, {ecall, Function, Args}})`.
 
 All of them return node-tagged results, `{Node, Value}`, so the caller knows which node answered.
 
@@ -363,6 +365,8 @@ Reports the state of this node's connection to `Node`: `{ok, #{status := connect
 | `cast_one/4` | one | nothing | `ok` | none reported |
 | `cast_all/4` | all | nothing | `ok` | none reported |
 
+For `call_any/4,5`, `call_all/4,5` and `call_all_wait/4`, a killed per-node caller counts as `{badrpc, Reason}`, and a killed or crashed master raises `exit({Reason, {ecall, Function, Args}})`.
+
 ## Semantics and limits
 
 - **Ordering is preserved per caller.** A caller always maps to the same proxy, a proxy emits batches in order, and the worker replays each batch in order. That is exactly Erlang's own guarantee: nothing is promised about the interleaving of different callers, and cast and call bodies run in independent processes with no ordering at all.
@@ -391,7 +395,7 @@ make clean_all           # clean_logs + clean_build
 make test
 ```
 
-Runs four Common Test suites: `ecall_app_SUITE` (`pool_size` validation at application start), `ecall_receive_SUITE` (the receiver pool), `ecall_connection_SUITE` (routing, pool lifecycle and invalidation against a fake receiver pool) and `ecall_reincarnation_SUITE`, which starts `peer` nodes running the real application, crashes one and restarts it under the same name. The last one needs a distributed test node, so the target passes `--sname ecall_ct` and `epmd` must be available.
+Runs five Common Test suites: `ecall_app_SUITE` (`pool_size` validation at application start), `ecall_receive_SUITE` (the receiver pool), `ecall_connection_SUITE` (routing, pool lifecycle and invalidation against a fake receiver pool), `ecall_reincarnation_SUITE` (crashing and restarting a real application peer under the same node name) and `ecall_group_SUITE` (group call results and monitored process failures). The last two start `peer` nodes and need a distributed test node, so the target passes `--sname ecall_ct` and `epmd` must be available.
 
 
 ### Performance tests
