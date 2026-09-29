@@ -81,7 +81,7 @@ The proxy loop is the whole idea:
 worker_loop(Remote, BatchSize) ->
   erlang:garbage_collect(self()),
   Requests = collect_requests(0, BatchSize),
-  catch Remote ! {batch, Requests},
+  Remote ! {batch, Requests},
   worker_loop(Remote, BatchSize).
 
 collect_requests(0, BatchSize) ->
