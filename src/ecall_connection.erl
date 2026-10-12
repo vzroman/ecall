@@ -458,7 +458,7 @@ spawn_incarnation( RemoteMaster )->
 %%=================================================================
 -spec worker_loop(pid(), pos_integer()) -> no_return().
 worker_loop( Remote, BatchSize )->
-  erlang:garbage_collect(self()),
+  erlang:garbage_collect(self(),[{type, minor}]),
   Requests = collect_requests( _Count = 0, BatchSize ),
   Remote ! {batch, Requests},
   worker_loop( Remote, BatchSize ).
