@@ -141,7 +141,6 @@ worker_loop( State )->
   receive
     {batch, Batch}->
       State1 = handle_batch(Batch, State),
-      erlang:garbage_collect(self(),[{type, minor}]),
       worker_loop( State1 );
     {{'DOWN', Ref, ClientPID}, _MonRef, process, _PID, Reason}->
       if
